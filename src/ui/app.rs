@@ -637,6 +637,11 @@ fn decode_image(
     } else {
         sniffed.to_string()
     };
+    if let (Some(w), Some(h)) = (hll, vll) {
+        if w == 0 || h == 0 {
+            anyhow::bail!("record has zero image dimensions (HLL x VLL)");
+        }
+    }
     let (rgb, source, ppi, width, height) = if compression_upper.starts_with("WSQ") {
         let (color, decoded) = crate::ui::image_render::wsq_to_color_image(data)?;
         let rgb = color_to_rgb(&color);
@@ -663,10 +668,11 @@ fn decode_image(
         let h = img.height();
         (img, "PNG".to_string(), None, w, h)
     } else {
-        // Raw 8-bit grayscale (typical for NONE-compressed Type-3..8 records).
+        // Raw pixels (typical for NONE-compressed Type-3..8 records).
         if let (Some(w), Some(h)) = (hll, vll) {
             let needed = (w as usize) * (h as usize);
-            if data.len() >= needed {
+            if w > 0 && h > 0 && data.len() >= needed {
+                // 8-bit grayscale, one byte per pixel.
                 let mut rgb = image::RgbImage::new(w, h);
                 for (i, px) in rgb.pixels_mut().enumerate() {
                     let g = data[i];
@@ -677,6 +683,27 @@ fn decode_image(
                     height: h,
                     rgb,
                     source: format!("raw grayscale ({compression})"),
+                    ppi: None,
+                });
+            }
+            // Bi-level (1 bit per pixel, MSB-first) — used by Type-8 signature
+            // records with ISR=1. Bits set to 1 are ink (black).
+            let row_bytes = ((w as usize) + 7) / 8;
+            if w > 0 && h > 0 && data.len() >= row_bytes * (h as usize) {
+                let mut rgb = image::RgbImage::new(w, h);
+                for y in 0..h as usize {
+                    for x in 0..w as usize {
+                        let byte = data[y * row_bytes + x / 8];
+                        let bit = (byte >> (7 - (x % 8))) & 1;
+                        let g = if bit == 1 { 0u8 } else { 255u8 };
+                        rgb.put_pixel(x as u32, y as u32, image::Rgb([g, g, g]));
+                    }
+                }
+                return Ok(DecodedPixels {
+                    width: w,
+                    height: h,
+                    rgb,
+                    source: format!("raw bi-level bitmap ({compression})"),
                     ppi: None,
                 });
             }

@@ -403,6 +403,9 @@ fn read_text_record(cursor: &mut Cursor<'_>, record_type: u8, charset: Charset) 
 /// a big-endian length, followed by a fixed-size header and then `length - 18`
 /// bytes of image data. See ANSI/NIST-ITL 1-2011 Table 4.
 fn read_binary_record(cursor: &mut Cursor<'_>, record_type: u8) -> Result<NistRecord> {
+    if record_type == 8 {
+        return read_signature_record(cursor);
+    }
     let len_bytes = cursor.read_n(4)?;
     let length = u32::from_be_bytes([len_bytes[0], len_bytes[1], len_bytes[2], len_bytes[3]]) as usize;
     // Header is 18 bytes total: LEN(4) IDC(1) IMP(1) FGP(6) ISR(1) HLL(2)
@@ -572,6 +575,59 @@ pub fn decode(bytes: &[u8]) -> Result<NistFile> {
         records,
         bytes_read: cursor.pos,
     })
+}
+
+/// Parse a Type-8 signature record. Its binary header differs from the
+/// Type-3..6 fingerprint layout: LEN(4) IDC(1) SIG(1) SRT(1) ISR(1) HLL(2)
+/// VLL(2), followed by `LEN - 12` payload bytes. Uncompressed signatures
+/// (ISR = 1) store one **bit** per pixel, MSB-first per byte.
+fn read_signature_record(cursor: &mut Cursor<'_>) -> Result<NistRecord> {
+    const HEADER_SIZE: usize = 12;
+    let len_bytes = cursor.read_n(4)?;
+    let length = u32::from_be_bytes([len_bytes[0], len_bytes[1], len_bytes[2], len_bytes[3]]) as usize;
+    if length < HEADER_SIZE {
+        bail!("Type-8: invalid record length {length}");
+    }
+    let idc = cursor.read_n(1)?[0];
+    let sig = cursor.read_n(1)?[0];
+    let srt = cursor.read_n(1)?[0];
+    let isr = cursor.read_n(1)?[0];
+    let hll_bytes = cursor.read_n(2)?;
+    let hll = u16::from_be_bytes([hll_bytes[0], hll_bytes[1]]);
+    let vll_bytes = cursor.read_n(2)?;
+    let vll = u16::from_be_bytes([vll_bytes[0], vll_bytes[1]]);
+
+    let payload_len = length - HEADER_SIZE;
+    let payload = if cursor.pos + payload_len <= cursor.bytes.len() {
+        let data = cursor.bytes[cursor.pos..cursor.pos + payload_len].to_vec();
+        cursor.pos += payload_len;
+        data
+    } else {
+        let data = cursor.bytes[cursor.pos..].to_vec();
+        cursor.pos = cursor.bytes.len();
+        data
+    };
+
+    let compression = sniff_compression(&payload)
+        .map(str::to_string)
+        .unwrap_or_else(|| "NONE".into());
+
+    let record = NistRecord {
+        record_type: 8,
+        idc,
+        fields: vec![
+            TextField::new(1, "LEN", length.to_string()),
+            TextField::new(2, "IDC", idc.to_string()),
+            TextField::new(3, "SIG", sig.to_string()),
+            TextField::new(4, "SRT", srt.to_string()),
+            TextField::new(5, "ISR", isr.to_string()),
+            TextField::new(6, "HLL", hll.to_string()),
+            TextField::new(7, "VLL", vll.to_string()),
+            TextField::new(8, "GCA", compression),
+        ],
+        image_data: Some(payload),
+    };
+    Ok(record)
 }
 
 /// Sniffs the image payload's magic bytes to determine the compression.
