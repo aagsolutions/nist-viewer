@@ -29,9 +29,10 @@ impl NistFile {
     }
 }
 
-fn set_field(record: &mut NistRecord, number: u16, code: &str, value: String) {
+pub(super) fn set_field(record: &mut NistRecord, number: u16, code: &str, value: String) {
     if let Some(field) = record.fields.iter_mut().find(|f| f.field == number) {
         field.value = value;
+        field.code = code.into();
     } else {
         let index = record
             .fields
@@ -233,7 +234,7 @@ fn binary_record(record: &mut NistRecord) -> Result<Vec<u8>> {
         header[12] = numeric_field(record, 5)?;
         header[13..15].copy_from_slice(&numeric_field::<u16>(record, 6)?.to_be_bytes());
         header[15..17].copy_from_slice(&numeric_field::<u16>(record, 7)?.to_be_bytes());
-        // GCA is displayed using magic-byte detection; preserve its original byte.
+        // Preserve the GCA byte, which image replacement updates explicitly.
     }
     let mut bytes = header.clone();
     bytes.extend(payload);

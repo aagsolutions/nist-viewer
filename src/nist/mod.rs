@@ -28,6 +28,7 @@
 //! header followed by a binary data payload.
 
 pub mod format;
+pub mod image;
 pub mod parser;
 pub mod records;
 pub mod writer;

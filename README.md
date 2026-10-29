@@ -23,8 +23,10 @@ It parses traditional encoding, lists all logical records in the file, shows rec
   - Editable field tables for text records and legacy binary record headers
   - Recalculate every record's byte length (`LEN`) and the transaction contents directory (`CNT`), including updated IDC values
   - Save and Save As for NIST files, with automatic recalculation before saving
+  - Replace record images from JPEG, PNG, WSQ, BMP, or TIFF files, with updated dimensions and encoding metadata
   - Unsaved changes indicator and prompts before opening another file or closing
   - Async (background-thread) image decoding so the UI stays responsive
+  - Automatic image previews on selection, retained through metadata edits and saving
   - Zoom in/out/fit, scrollable image panes
   - Export the decoded image as PNG (full resolution)
   - Keyboard shortcuts: `⌘/Ctrl+O` open, `⌘/Ctrl+S` save NIST file, `⌘/Ctrl+Shift+S` save NIST file as
@@ -45,9 +47,19 @@ Select a record and edit its values in the field table. For image records, expan
 
 Click **Recalculate fields** to apply and validate the edits and refresh `LEN` and `CNT`. **File ▸ Save NIST file** and **Save NIST file as…** also recalculate automatically. `LEN` includes the encoded byte length of the entire record, and `CNT` lists each record's type and IDC in file order, as specified by [ANSI/NIST-ITL](https://nvlpubs.nist.gov/nistpubs/SpecialPublications/NIST.SP.500-290e3.pdf). These calculated fields are read-only.
 
-Saving preserves embedded image bytes, uninterpreted binary header bytes, and unchanged encoded field values. Writes use a temporary file in the destination directory before replacing the destination. Invalid edits keep their drafts for correction. Files with incomplete parsing remain viewable but cannot be saved.
+Saving preserves images you have not replaced, uninterpreted binary header bytes, and unchanged encoded field values. Writes use a temporary file in the destination directory before replacing the destination. Invalid edits keep their drafts for correction. Files with incomplete parsing remain viewable but cannot be saved.
 
-Editing changes existing metadata fields; it does not replace or recompress images. The character set declaration (`DCS`) and detected binary compression are read-only. Type-1 values must remain ASCII, and edits in other records must fit the file's declared character set. Image export remains available through **File ▸ Save image as PNG…**.
+The character set declaration (`DCS`) and detected binary compression are read-only. Type-1 values must remain ASCII, and edits in other records must fit the file's declared character set. Image export remains available through **File ▸ Save image as PNG…**.
+
+## Replacing Images
+
+Select an image record and click **Replace image…**, or use **Image ▸ Replace image…**. Choose a JPEG, PNG, WSQ, BMP, or TIFF file. The replacement updates the preview, dimensions (`HLL`/`VLL`), compression (`CGA`/`GCA`), bit depth and color space where applicable, and record lengths. Pending field edits are applied together with the image. Save the NIST file to keep the replacement; importing does not modify the source image file.
+
+- Type-10 and Type-13–17 records retain compatible JPEG/PNG images. Other raster formats, transparency, and required color conversions are normalized to an 8-bit PNG. Fingerprint and palm images are converted to grayscale; transparency is composited onto white.
+- Type-3/4 records store raster imports as uncompressed 8-bit grayscale. Imported WSQ files remain WSQ in Type-3/4 and Type-13–16 records; the app does not encode new WSQ files.
+- Type-5/6 and Type-8 records store uncompressed one-bit images using a grayscale threshold of 128. Signature representation (`SRT`) is updated accordingly. Binary image dimensions must fit the 16-bit header.
+
+Replacement supports Type-3–6, Type-8, Type-10, and Type-13–17 image records. Custom Type-7 payloads and other record layouts are not replaced. Existing scan resolution, capture details, quality scores, annotations, and related minutiae records are retained; review these when using a different image, since they are not inferred or recomputed from its pixels.
 
 ## Testing
 
@@ -58,6 +70,8 @@ cargo test
 The test suite includes golden-value verification of the WSQ decoder: `test_data/sample.wsq` must decode **pixel-identically** to `test_data/sample.png` (the reference output produced by the NBIS-compatible [jnbis](https://github.com/mhshams/jnbis) Java decoder). Additional tests parse and decode the bundled Type-3, Type-4, Type-10 and Type-14 reference files.
 
 Editing tests also verify byte-for-byte round trips of every bundled NIST file, recalculation after metadata edits, UTF-8/UTF-16/Latin-1 encoding, binary header preservation, and rejection of invalid edits or incomplete input.
+
+Image replacement tests save and reopen edited records, check payloads and encoding metadata, cover grayscale/bi-level conversion and transparency, and verify failed imports preserve the original image and pending edits.
 
 There is also a small debugging helper that dumps every decodable image of a file to `/tmp`:
 

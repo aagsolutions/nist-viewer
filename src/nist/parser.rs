@@ -321,6 +321,18 @@ fn code_for(record_type: u8, field: u16) -> String {
         (14, 22) => "NQM",
         (14, 999) => "DATA",
         (15, 999) => "DATA",
+        // Type-16/17 image metadata uses the same image layout, with CSP at 13.
+        (16..=17, 1) => "LEN",
+        (16..=17, 2) => "IDC",
+        (16..=17, 6) => "HLL",
+        (16..=17, 7) => "VLL",
+        (16..=17, 8) => "SLC",
+        (16..=17, 9) => "HPS",
+        (16..=17, 10) => "VPS",
+        (16..=17, 11) => "CGA",
+        (16..=17, 12) => "BPX",
+        (16..=17, 13) => "CSP",
+        (16..=17, 999) => "DATA",
         _ => "",
     }
     .to_string()
@@ -454,17 +466,25 @@ fn read_binary_record(cursor: &mut Cursor<'_>, record_type: u8) -> Result<NistRe
     let header = cursor.bytes[start..cursor.pos].to_vec();
     let payload = cursor.read_n(length - 18)?.to_vec();
 
-    // The 1-byte GCA code (0=NONE, 1=JPEGB, 2=JPEGL) predates WSQ; sniff the
-    // payload magic so WSQ/JPEG content is recognized regardless of timing
-    // when the encoder was written.
-    let compression = sniff_compression(&payload)
-        .map(str::to_string)
-        .unwrap_or_else(|| match gca {
-            0 => "NONE".to_string(),
-            1 => "JPEGB".to_string(),
-            2 => "JPEGL".to_string(),
-            other => format!("UNKNOWN({other})"),
-        });
+    // Exact-sized uncompressed pixels can coincidentally start with image magic.
+    let raw_size = if matches!(record_type, 5 | 6) {
+        usize::from(hll).div_ceil(8) * usize::from(vll)
+    } else {
+        usize::from(hll) * usize::from(vll)
+    };
+    let compression = if gca == 0 && payload.len() == raw_size {
+        "NONE".into()
+    } else {
+        sniff_compression(&payload)
+            .map(str::to_string)
+            .unwrap_or_else(|| match gca {
+                0 => "NONE".to_string(),
+                1 => "WSQ20".to_string(),
+                2 => "JPEGB".to_string(),
+                3 => "JPEGL".to_string(),
+                other => format!("UNKNOWN({other})"),
+            })
+    };
 
     let record = NistRecord {
         record_type,
@@ -622,9 +642,14 @@ fn read_signature_record(cursor: &mut Cursor<'_>) -> Result<NistRecord> {
     let header = cursor.bytes[start..cursor.pos].to_vec();
     let payload = cursor.read_n(length - HEADER_SIZE)?.to_vec();
 
-    let compression = sniff_compression(&payload)
-        .map(str::to_string)
-        .unwrap_or_else(|| "NONE".into());
+    let compression =
+        if srt == 0 && payload.len() == usize::from(hll).div_ceil(8) * usize::from(vll) {
+            "NONE".into()
+        } else {
+            sniff_compression(&payload)
+                .map(str::to_string)
+                .unwrap_or_else(|| "NONE".into())
+        };
 
     let record = NistRecord {
         record_type: 8,

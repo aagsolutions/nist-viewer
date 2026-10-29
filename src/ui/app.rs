@@ -43,7 +43,7 @@ pub struct NistViewerApp {
     /// User-controlled zoom factor (1.0 = original pixels).
     zoom: f32,
     /// Background task result for decoding the selected image.
-    pending_decode: Option<(usize, Receiver<Result<DecodedPixels>>)>,
+    pending_decode: Option<PendingDecode>,
     /// Last error message to show in the status bar.
     status: Option<String>,
     close_confirmed: bool,
@@ -74,12 +74,20 @@ struct DecodedPixels {
     ppi: Option<u32>,
 }
 
+struct PendingDecode {
+    record_index: usize,
+    revision: u64,
+    receiver: Receiver<Result<DecodedPixels>>,
+}
+
 /// A loaded NIST file plus any cached per-record state.
 struct LoadedFile {
     path: PathBuf,
     nist: NistFile,
     /// Cached image textures for already-decoded records.
     image_cache: Vec<Option<DecodedImage>>,
+    image_revisions: Vec<u64>,
+    image_errors: Vec<Option<String>>,
     /// The size in bytes of the file on disk.
     file_size: u64,
     dirty: bool,
@@ -94,6 +102,8 @@ impl LoadedFile {
             path,
             nist,
             image_cache: (0..n).map(|_| None).collect(),
+            image_revisions: vec![0; n],
+            image_errors: vec![None; n],
             file_size,
             dirty: false,
             field_drafts: BTreeMap::new(),
@@ -127,11 +137,30 @@ impl LoadedFile {
     }
 
     fn commit(&mut self, nist: NistFile) {
-        if !self.field_drafts.is_empty() {
-            self.image_cache.iter_mut().for_each(|slot| *slot = None);
+        for (index, record) in nist.all_records().enumerate() {
+            let unchanged = self.record(index).is_some_and(|old| {
+                old.image_data == record.image_data
+                    && record_dims(old) == record_dims(record)
+                    && old.compression_algorithm() == record.compression_algorithm()
+                    && matches!(old.record_type, 5 | 6 | 8)
+                        == matches!(record.record_type, 5 | 6 | 8)
+            });
+            if !unchanged {
+                self.image_cache[index] = None;
+                self.image_errors[index] = None;
+                self.image_revisions[index] += 1;
+            }
         }
         self.nist = nist;
         self.field_drafts.clear();
+    }
+
+    fn replace_image(&mut self, index: usize, bytes: &[u8]) -> Result<()> {
+        let (mut candidate, _) = self.prepare_save()?;
+        candidate.replace_image(index, bytes)?;
+        self.commit(candidate);
+        self.dirty = true;
+        Ok(())
     }
 }
 
@@ -215,7 +244,12 @@ impl NistViewerApp {
         {
             return;
         }
-        let Some(file) = self.file.as_ref() else {
+        self.start_image_decode();
+    }
+
+    /// Preview committed image data without applying unfinished metadata drafts.
+    fn start_image_decode(&mut self) {
+        let Some(file) = self.file.as_mut() else {
             return;
         };
         let Some(record) = file.record(self.selected_record) else {
@@ -227,25 +261,73 @@ impl NistViewerApp {
         };
         let compression = record.compression_algorithm().unwrap_or("NONE").to_string();
         let (hll, vll) = record_dims(record);
+        let bitonal = matches!(record.record_type, 5 | 6 | 8);
+        let revision = file.image_revisions[self.selected_record];
+        file.image_errors[self.selected_record] = None;
         let (tx, rx) = channel();
         // We do the actual decode on a background thread to keep the UI smooth.
         std::thread::spawn(move || {
-            let result = decode_image(&image_data, &compression, hll, vll);
+            let result = decode_image(&image_data, &compression, hll, vll, bitonal);
             let _ = tx.send(result);
         });
-        self.pending_decode = Some((self.selected_record, rx));
+        self.pending_decode = Some(PendingDecode {
+            record_index: self.selected_record,
+            revision,
+            receiver: rx,
+        });
+    }
+
+    fn ensure_selected_image_decoded(&mut self) {
+        let Some(file) = self.file.as_ref() else {
+            return;
+        };
+        let index = self.selected_record;
+        if file
+            .record(index)
+            .is_some_and(|record| record.image_data.is_some())
+            && file.image_cache[index].is_none()
+            && file.image_errors[index].is_none()
+            && !self.pending_decode.as_ref().is_some_and(|pending| {
+                pending.record_index == index && pending.revision == file.image_revisions[index]
+            })
+        {
+            self.start_image_decode();
+        }
     }
 
     /// Stores the result of a pending decode into the per-record cache.
     fn finish_pending_decode(&mut self, ctx: &egui::Context) {
-        let Some((record_index, rx)) = self.pending_decode.take() else {
+        let Some(pending) = self.pending_decode.take() else {
             return;
         };
-        match rx.try_recv() {
+        let record_index = pending.record_index;
+        if self
+            .file
+            .as_ref()
+            .and_then(|file| file.image_revisions.get(record_index))
+            != Some(&pending.revision)
+        {
+            return; // The record was replaced while this worker was decoding.
+        }
+        match pending.receiver.try_recv() {
             Ok(Ok(pixels)) => {
+                let maximum_side = ctx.input(|input| input.max_texture_side).clamp(1, 4096) as u32;
+                let (display_width, display_height) =
+                    scaled_size(pixels.width, pixels.height, maximum_side);
+                let display_rgb =
+                    if (display_width, display_height) == (pixels.width, pixels.height) {
+                        pixels.rgb
+                    } else {
+                        image::imageops::resize(
+                            &pixels.rgb,
+                            display_width,
+                            display_height,
+                            image::imageops::FilterType::Triangle,
+                        )
+                    };
                 let texture = ctx.load_texture(
                     format!("nist-image-{record_index}"),
-                    rgb_to_color_image(&pixels.rgb),
+                    rgb_to_color_image(&display_rgb),
                     egui::TextureOptions::LINEAR,
                 );
                 let image = DecodedImage {
@@ -262,17 +344,24 @@ impl NistViewerApp {
                 }
             }
             Ok(Err(e)) => {
-                self.status = Some(format!("Image decode failed: {:#}", e));
+                self.record_decode_error(record_index, format!("Image decode failed: {e:#}"));
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => {
                 // Not ready yet — put the receiver back.
-                self.pending_decode = Some((record_index, rx));
+                self.pending_decode = Some(pending);
                 ctx.request_repaint();
             }
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                self.status = Some("Image decode worker disappeared".into());
+                self.record_decode_error(record_index, "Image decode worker disappeared".into());
             }
         }
+    }
+
+    fn record_decode_error(&mut self, index: usize, error: String) {
+        if let Some(file) = self.file.as_mut() {
+            file.image_errors[index] = Some(error.clone());
+        }
+        self.status = Some(error);
     }
 
     /// Saves the currently decoded image to disk.
@@ -307,16 +396,63 @@ impl NistViewerApp {
             dialog = dialog.set_directory(parent);
         }
         let (hll, vll) = record_dims(record);
+        let bitonal = matches!(record.record_type, 5 | 6 | 8);
         if let Some(target) = dialog.save_file() {
-            let result = decode_image(&image_data, &compression, hll, vll).and_then(|px| {
-                px.rgb
-                    .save(&target)
-                    .with_context(|| format!("writing {}", target.display()))
-            });
+            let result =
+                decode_image(&image_data, &compression, hll, vll, bitonal).and_then(|px| {
+                    px.rgb
+                        .save(&target)
+                        .with_context(|| format!("writing {}", target.display()))
+                });
             match result {
                 Ok(_) => self.status = Some(format!("Saved image to {}", target.display())),
                 Err(e) => self.status = Some(format!("Save failed: {:#}", e)),
             }
+        }
+    }
+
+    fn replace_image_dialog(&mut self) {
+        let Some(file) = self.file.as_ref() else {
+            return;
+        };
+        if !file.nist.warnings.is_empty()
+            || !file
+                .record(self.selected_record)
+                .is_some_and(NistRecord::can_replace_image)
+        {
+            return;
+        }
+        let mut dialog = FileDialog::new()
+            .set_title("Replace selected record image")
+            .add_filter(
+                "Images (JPEG, PNG, WSQ, BMP, TIFF)",
+                &["jpg", "jpeg", "png", "wsq", "bmp", "tif", "tiff"],
+            );
+        if let Some(parent) = file.path.parent() {
+            dialog = dialog.set_directory(parent);
+        }
+        let Some(path) = dialog.pick_file() else {
+            return;
+        };
+        let result = std::fs::read(&path)
+            .with_context(|| format!("Reading {}", path.display()))
+            .and_then(|bytes| {
+                self.file
+                    .as_mut()
+                    .unwrap()
+                    .replace_image(self.selected_record, &bytes)
+            });
+        match result {
+            Ok(()) => {
+                self.pending_decode = None;
+                self.zoom = 1.0;
+                self.decode_selected();
+                self.status = Some(format!(
+                    "Replaced image from {}. Metadata and lengths updated; save the NIST file to keep the change.",
+                    path.display()
+                ));
+            }
+            Err(error) => self.status = Some(format!("Cannot replace image: {error:#}")),
         }
     }
 
@@ -328,7 +464,6 @@ impl NistViewerApp {
             Ok((nist, _)) => {
                 file.commit(nist);
                 file.dirty = true;
-                self.pending_decode = None;
                 self.status = Some(
                     "Recalculated all LEN fields and the CNT directory. Changes are not saved yet."
                         .into(),
@@ -379,7 +514,6 @@ impl NistViewerApp {
                 file.path = target.clone();
                 file.file_size = bytes.len() as u64;
                 file.dirty = false;
-                self.pending_decode = None;
                 self.status = Some(format!(
                     "Saved {} (LEN and CNT recalculated)",
                     target.display()
@@ -434,6 +568,7 @@ impl eframe::App for NistViewerApp {
         self.render_top_bar(ui);
         self.render_status_bar(ui);
         self.render_left_panel(ui);
+        self.ensure_selected_image_decoded();
         CentralPanel::default().show(ui, |ui| {
             self.render_central(ui);
         });
@@ -514,6 +649,19 @@ impl NistViewerApp {
                         .clicked()
                     {
                         self.decode_selected();
+                        ui.close();
+                    }
+                    let can_replace = self.file.as_ref().is_some_and(|file| {
+                        file.nist.warnings.is_empty()
+                            && file
+                                .record(self.selected_record)
+                                .is_some_and(NistRecord::can_replace_image)
+                    });
+                    if ui
+                        .add_enabled(can_replace, egui::Button::new("Replace image…"))
+                        .clicked()
+                    {
+                        self.replace_image_dialog();
                         ui.close();
                     }
                     ui.separator();
@@ -670,14 +818,22 @@ impl NistViewerApp {
             (Some(hll), Some(vll)) => Some((hll, vll)),
             _ => None,
         };
+        let can_replace = file.nist.warnings.is_empty() && rec.can_replace_image();
 
         ui.heading(header);
         ui.separator();
 
         let mut decode_clicked = false;
+        let mut replace_clicked = false;
         ui.horizontal(|ui| {
             if ui.button("Decode image").clicked() {
                 decode_clicked = true;
+            }
+            if ui
+                .add_enabled(can_replace, egui::Button::new("Replace image…"))
+                .clicked()
+            {
+                replace_clicked = true;
             }
             ui.label(format!("Compression: {compression}"));
             if let Some((hll, vll)) = native_size {
@@ -686,6 +842,9 @@ impl NistViewerApp {
         });
         if decode_clicked {
             self.decode_selected();
+        }
+        if replace_clicked {
+            self.replace_image_dialog();
         }
 
         ui.separator();
@@ -719,9 +878,12 @@ impl NistViewerApp {
                     .map(|p| p.to_string())
                     .unwrap_or_else(|| "?".to_string())
             ));
+        } else if let Some(error) = &file.image_errors[self.selected_record] {
+            ui.colored_label(Color32::LIGHT_RED, error);
         } else {
+            ui.spinner();
             ui.label(
-                RichText::new("No image decoded yet. Press \"Decode image\" above.")
+                RichText::new("Decoding image…")
                     .italics()
                     .color(Color32::GRAY),
             );
@@ -768,8 +930,6 @@ impl NistViewerApp {
             file.nist.warnings.is_empty(),
         ) {
             file.dirty = true;
-            self.pending_decode = None;
-            file.image_cache.iter_mut().for_each(|slot| *slot = None);
             self.status =
                 Some("Fields modified. Recalculate or save to update LEN and CNT.".into());
         }
@@ -946,11 +1106,23 @@ fn decode_image(
     compression: &str,
     hll: Option<u32>,
     vll: Option<u32>,
+    bitonal: bool,
 ) -> Result<DecodedPixels> {
-    // Sniff the payload magic first — the declared GCA/CGA code is not always
-    // trustworthy (especially the 1-byte GCA of legacy binary Type-3..8
-    // records, which predates WSQ).
-    let sniffed = crate::nist::parser::sniff_compression(data).unwrap_or("");
+    // Exact-sized raw pixels can start with bytes resembling a compressed image.
+    let exact_raw = compression.eq_ignore_ascii_case("NONE")
+        && hll.zip(vll).is_some_and(|(w, h)| {
+            let row_bytes = if bitonal {
+                (w as usize).div_ceil(8)
+            } else {
+                w as usize
+            };
+            row_bytes.checked_mul(h as usize) == Some(data.len())
+        });
+    let sniffed = if exact_raw {
+        ""
+    } else {
+        crate::nist::parser::sniff_compression(data).unwrap_or("")
+    };
     let compression_upper = if sniffed.is_empty() {
         compression.to_ascii_uppercase()
     } else {
@@ -990,7 +1162,7 @@ fn decode_image(
         // Raw pixels (typical for NONE-compressed Type-3..8 records).
         if let (Some(w), Some(h)) = (hll, vll) {
             let needed = (w as usize) * (h as usize);
-            if w > 0 && h > 0 && data.len() >= needed {
+            if !bitonal && w > 0 && h > 0 && data.len() >= needed {
                 // 8-bit grayscale, one byte per pixel.
                 let mut rgb = image::RgbImage::new(w, h);
                 for (i, px) in rgb.pixels_mut().enumerate() {
@@ -1005,9 +1177,8 @@ fn decode_image(
                     ppi: None,
                 });
             }
-            // Bi-level (1 bit per pixel, MSB-first) — used by Type-8 signature
-            // records with ISR=1. Bits set to 1 are ink (black).
-            let row_bytes = ((w as usize) + 7) / 8;
+            // Bi-level Type-5/6/8 pixels, MSB first; 1 means ink (black).
+            let row_bytes = (w as usize).div_ceil(8);
             if w > 0 && h > 0 && data.len() >= row_bytes * (h as usize) {
                 let mut rgb = image::RgbImage::new(w, h);
                 for y in 0..h as usize {
@@ -1068,6 +1239,25 @@ mod tests {
         let path = PathBuf::from("test_data/type-3.an2");
         let (nist, size) = load_nist_file(&path).unwrap();
         LoadedFile::new(path, nist, size)
+    }
+
+    fn complete_preview(app: &mut NistViewerApp, ctx: &egui::Context) {
+        let mut pending = app
+            .pending_decode
+            .take()
+            .expect("image decode was not started");
+        let pixels = pending
+            .receiver
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("image worker did not finish");
+        let (tx, rx) = channel();
+        tx.send(pixels).unwrap();
+        pending.receiver = rx;
+        app.pending_decode = Some(pending);
+        ctx.run_ui(egui::RawInput::default(), |_| {
+            app.finish_pending_decode(ctx)
+        })
+        .drop_without_applying_deltas();
     }
 
     #[test]
@@ -1150,5 +1340,275 @@ mod tests {
             egui::CentralPanel::default().show(ui, |ui| app.render_selected_fields(ui));
         });
         output.drop_without_applying_deltas();
+    }
+
+    #[test]
+    fn image_replacement_applies_drafts_marks_dirty_and_saves_the_new_pixels() {
+        let mut file = loaded_fixture();
+        let index = file
+            .nist
+            .all_records()
+            .position(NistRecord::can_replace_image)
+            .unwrap();
+        file.field_drafts.insert((0, 9), "edited with image".into());
+        let pixels = image::GrayImage::from_raw(3, 2, vec![0, 50, 100, 150, 200, 255]).unwrap();
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageLuma8(pixels.clone())
+            .write_to(&mut png, image::ImageFormat::Png)
+            .unwrap();
+        file.replace_image(index, png.get_ref()).unwrap();
+        assert!(file.dirty);
+        assert!(file.field_drafts.is_empty());
+        assert_eq!(
+            file.nist.transaction.field_value("TCN"),
+            Some("edited with image")
+        );
+        let record = file.record(index).unwrap();
+        let (w, h) = record_dims(record);
+        let preview = decode_image(
+            record.image_data.as_ref().unwrap(),
+            record.compression_algorithm().unwrap(),
+            w,
+            h,
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            preview.rgb,
+            image::DynamicImage::ImageLuma8(pixels).to_rgb8()
+        );
+
+        let directory = tempfile::tempdir().unwrap();
+        file.path = directory.path().join("replacement.an2");
+        let mut app = NistViewerApp::new();
+        app.file = Some(file);
+        assert!(app.save_nist_file(false));
+        let file = app.file.as_ref().unwrap();
+        assert!(!file.dirty);
+        let (saved, _) = load_nist_file(&file.path).unwrap();
+        assert_eq!(
+            saved.all_records().nth(index).unwrap().image_data,
+            file.record(index).unwrap().image_data
+        );
+    }
+
+    #[test]
+    fn failed_image_replacement_preserves_pending_edits_and_original_image() {
+        let mut file = loaded_fixture();
+        let index = file
+            .nist
+            .all_records()
+            .position(NistRecord::can_replace_image)
+            .unwrap();
+        let original = file.record(index).unwrap().image_data.clone();
+        file.field_drafts.insert((0, 9), "pending".into());
+        file.dirty = true;
+        assert!(file.replace_image(index, b"invalid image").is_err());
+        assert_eq!(file.record(index).unwrap().image_data, original);
+        assert_eq!(file.field_drafts[&(0, 9)], "pending");
+        assert_eq!(file.nist.transaction.field_value("TCN"), Some("jck t3"));
+        assert!(file.dirty);
+    }
+
+    #[test]
+    fn bitonal_previews_use_bits_even_for_narrow_images_or_magic_like_pixels() {
+        let narrow = decode_image(&[0x80, 0], "NONE", Some(1), Some(2), true).unwrap();
+        assert_eq!(narrow.rgb.get_pixel(0, 0).0, [0, 0, 0]);
+        assert_eq!(narrow.rgb.get_pixel(0, 1).0, [255, 255, 255]);
+        let magic = decode_image(&[0xff, 0xa0], "NONE", Some(16), Some(1), true).unwrap();
+        assert_eq!(magic.rgb.get_pixel(8, 0).0, [0, 0, 0]);
+        assert_eq!(magic.rgb.get_pixel(9, 0).0, [255, 255, 255]);
+        let raw = decode_image(b"\x89PNG\r\n\x1a\n", "NONE", Some(8), Some(1), false).unwrap();
+        assert_eq!(raw.rgb.get_pixel(0, 0).0, [137, 137, 137]);
+    }
+
+    #[test]
+    fn saving_does_not_cancel_a_running_image_decode() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut file = loaded_fixture();
+        file.path = directory.path().join("preview.an2");
+        let index = file
+            .nist
+            .all_records()
+            .position(NistRecord::can_replace_image)
+            .unwrap();
+        let mut app = NistViewerApp::new();
+        app.file = Some(file);
+        app.selected_record = index;
+        app.decode_selected();
+        assert!(app.pending_decode.is_some());
+        assert!(app.save_nist_file(false));
+        assert!(
+            app.pending_decode.is_some(),
+            "saving discarded the preview worker's result"
+        );
+    }
+
+    #[test]
+    fn metadata_recalculation_keeps_a_decoded_image() {
+        let mut app = NistViewerApp::new();
+        app.file = Some(loaded_fixture());
+        let index = app
+            .file
+            .as_ref()
+            .unwrap()
+            .nist
+            .all_records()
+            .position(NistRecord::can_replace_image)
+            .unwrap();
+        app.selected_record = index;
+        let (tx, rx) = channel();
+        tx.send(Ok(DecodedPixels {
+            width: 1,
+            height: 1,
+            rgb: image::RgbImage::new(1, 1),
+            source: "test".into(),
+            ppi: None,
+        }))
+        .unwrap();
+        app.pending_decode = Some(PendingDecode {
+            record_index: index,
+            revision: 0,
+            receiver: rx,
+        });
+        let ctx = egui::Context::default();
+        ctx.run_ui(egui::RawInput::default(), |_| {
+            app.finish_pending_decode(&ctx)
+        })
+        .drop_without_applying_deltas();
+        assert!(app.file.as_ref().unwrap().image_cache[index].is_some());
+        app.file
+            .as_mut()
+            .unwrap()
+            .field_drafts
+            .insert((0, 9), "edited transaction".into());
+        assert!(app.recalculate_fields());
+        assert!(
+            app.file.as_ref().unwrap().image_cache[index].is_some(),
+            "text metadata edits discarded the decoded image"
+        );
+    }
+
+    #[test]
+    fn bundled_images_decode_automatically_and_are_painted_in_the_viewer() {
+        for name in [
+            "type-3.an2",
+            "type-9-4-iafis.an2",
+            "type-8-sig.an2",
+            "type-10-tattoo-face-sap20.an2",
+            "type-14-amp-nqm-utf8.an2",
+        ] {
+            let mut app = NistViewerApp::new();
+            app.load_file(PathBuf::from(format!("test_data/{name}")));
+            let indices: Vec<_> = app
+                .file
+                .as_ref()
+                .unwrap()
+                .nist
+                .all_records()
+                .enumerate()
+                .filter_map(|(i, record)| record.image_data.as_ref().map(|_| i))
+                .collect();
+            let ctx = egui::Context::default();
+            for index in indices {
+                app.selected_record = index;
+                app.ensure_selected_image_decoded();
+                complete_preview(&mut app, &ctx);
+                let file = app.file.as_ref().unwrap();
+                let decoded = file.image_cache[index]
+                    .as_ref()
+                    .unwrap_or_else(|| panic!("{name}: {:?}", file.image_errors[index]));
+                let texture = decoded.texture.id();
+                assert!(
+                    decoded
+                        .texture
+                        .size()
+                        .into_iter()
+                        .all(|side| side <= ctx.input(|input| input.max_texture_side))
+                );
+                assert_eq!(
+                    Some((decoded.width, decoded.height)),
+                    record_dims(file.record(index).unwrap())
+                        .0
+                        .zip(record_dims(file.record(index).unwrap()).1)
+                );
+                let input = egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        Vec2::new(1200.0, 800.0),
+                    )),
+                    ..Default::default()
+                };
+                let output = ctx.run_ui(input, |ui| {
+                    CentralPanel::default().show(ui, |ui| app.render_image_view(ui));
+                });
+                let painted = ctx.tessellate(output.shapes.clone(), output.pixels_per_point).iter()
+                    .any(|primitive| matches!(&primitive.primitive, egui::epaint::Primitive::Mesh(mesh) if mesh.texture_id == texture));
+                output.drop_without_applying_deltas();
+                assert!(
+                    painted,
+                    "{name}: record {index} decoded but did not display its texture"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn replacement_rejects_old_decode_results_and_displays_the_new_image() {
+        let mut app = NistViewerApp::new();
+        app.file = Some(loaded_fixture());
+        let index = app
+            .file
+            .as_ref()
+            .unwrap()
+            .nist
+            .all_records()
+            .position(NistRecord::can_replace_image)
+            .unwrap();
+        app.selected_record = index;
+        app.ensure_selected_image_decoded();
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageLuma8(image::GrayImage::new(3, 2))
+            .write_to(&mut png, image::ImageFormat::Png)
+            .unwrap();
+        app.file
+            .as_mut()
+            .unwrap()
+            .replace_image(index, png.get_ref())
+            .unwrap();
+        let ctx = egui::Context::default();
+        complete_preview(&mut app, &ctx);
+        assert!(app.file.as_ref().unwrap().image_cache[index].is_none());
+        app.ensure_selected_image_decoded();
+        complete_preview(&mut app, &ctx);
+        let decoded = app.file.as_ref().unwrap().image_cache[index]
+            .as_ref()
+            .unwrap();
+        assert_eq!((decoded.width, decoded.height), (3, 2));
+    }
+
+    #[test]
+    fn decode_errors_are_kept_for_display_without_restarting_each_frame() {
+        let mut app = NistViewerApp::new();
+        let mut file = loaded_fixture();
+        let index = file
+            .nist
+            .all_records()
+            .position(NistRecord::can_replace_image)
+            .unwrap();
+        file.nist.records[index - 1].image_data = Some(vec![0xff, 0xa0]);
+        app.file = Some(file);
+        app.selected_record = index;
+        app.ensure_selected_image_decoded();
+        let ctx = egui::Context::default();
+        complete_preview(&mut app, &ctx);
+        assert!(app.file.as_ref().unwrap().image_errors[index].is_some());
+        app.ensure_selected_image_decoded();
+        assert!(app.pending_decode.is_none());
+        app.decode_selected();
+        assert!(
+            app.pending_decode.is_some(),
+            "manual Decode must allow retrying"
+        );
     }
 }
