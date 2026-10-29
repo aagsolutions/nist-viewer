@@ -24,6 +24,7 @@ It parses traditional encoding, lists all logical records in the file, shows rec
   - Recalculate every record's byte length (`LEN`) and the transaction contents directory (`CNT`), including updated IDC values
   - Save and Save As for NIST files, with automatic recalculation before saving
   - Replace record images from JPEG, PNG, WSQ, BMP, or TIFF files, with updated dimensions and encoding metadata
+  - Resize embedded images with pixel dimensions, an aspect-ratio lock, and a preview
   - Unsaved changes indicator and prompts before opening another file or closing
   - Async (background-thread) image decoding so the UI stays responsive
   - Automatic image previews on selection, retained through metadata edits and saving
@@ -60,6 +61,14 @@ Select an image record and click **Replace image…**, or use **Image ▸ Replac
 - Type-5/6 and Type-8 records store uncompressed one-bit images using a grayscale threshold of 128. Signature representation (`SRT`) is updated accordingly. Binary image dimensions must fit the 16-bit header.
 
 Replacement supports Type-3–6, Type-8, Type-10, and Type-13–17 image records. Custom Type-7 payloads and other record layouts are not replaced. Existing scan resolution, capture details, quality scores, annotations, and related minutiae records are retained; review these when using a different image, since they are not inferred or recomputed from its pixels.
+
+## Resizing Images
+
+Select an image record and click **Resize image…**, or choose **Image ▸ Resize image…**. Enter the target width or height in pixels. **Keep aspect ratio** adjusts the other dimension automatically; turn it off to set both independently. The dialog shows the resulting proportions and output format. **Reset dimensions** restores the original size, and **Cancel** leaves the image and pending edits unchanged.
+
+Click **Apply resize** to resample the embedded pixels, refresh the preview, and recalculate image metadata and `LEN`/`CNT`. Save or Save As to write the resized image into the NIST file. Smooth images use Lanczos resampling; one-bit fingerprint and signature images use nearest-neighbor resampling to retain black/white pixels.
+
+Resized Type-10/13–17 images are stored as lossless 8-bit PNG, including images originally compressed as WSQ or JPEG. Legacy Type-3/4 records store raw grayscale; Type-5/6/8 records store packed one-bit pixels. Keeping the original dimensions preserves the original encoded image. Scan resolution and image annotations are retained and should be reviewed after resizing.
 
 ## Testing
 

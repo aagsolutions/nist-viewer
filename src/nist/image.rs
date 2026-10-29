@@ -1,9 +1,9 @@
-//! Image replacement with record-specific encoding and metadata updates.
+//! Image replacement and resizing with record-specific metadata updates.
 
 use std::io::Cursor;
 
 use anyhow::{Context, Result, ensure};
-use image::{ColorType, DynamicImage, GrayImage, ImageFormat, Rgb, RgbImage};
+use image::{ColorType, DynamicImage, GrayImage, ImageFormat, Luma, Rgb, RgbImage};
 
 use super::parser::NistFile;
 use super::records::NistRecord;
@@ -14,9 +14,143 @@ impl NistRecord {
     pub fn can_replace_image(&self) -> bool {
         self.image_data.is_some() && matches!(self.record_type, 3..=6 | 8 | 10 | 13..=17)
     }
+
+    /// Validate resize dimensions before allocating pixels or changing a record.
+    pub fn validate_resize(&self, width: u32, height: u32) -> Result<()> {
+        ensure!(
+            self.can_replace_image(),
+            "Resizing is not supported for Type-{}",
+            self.record_type
+        );
+        ensure!(
+            width > 0 && height > 0,
+            "Width and height must be greater than zero"
+        );
+        if (3..=8).contains(&self.record_type) {
+            ensure!(
+                width <= u16::MAX as u32 && height <= u16::MAX as u32,
+                "Legacy binary records support dimensions of at most 65535 pixels"
+            );
+        }
+        let allocation = u64::from(width)
+            .checked_mul(u64::from(height))
+            .and_then(|size| size.checked_mul(4));
+        let limit = image::Limits::default().max_alloc.unwrap_or(u64::MAX);
+        ensure!(
+            allocation.is_some_and(|size| size <= limit),
+            "Requested image exceeds the image processing memory limit; choose smaller dimensions"
+        );
+        Ok(())
+    }
+
+    /// Decode the full embedded image, including WSQ and legacy raw pixel layouts.
+    pub fn decoded_image(&self) -> Result<DynamicImage> {
+        let data = self.image_data.as_ref().context("Record has no image")?;
+        ensure!(
+            !(self.record_type == 8 && self.field_value("SRT") == Some("2")),
+            "Vector signature data cannot be resized as a raster image"
+        );
+        let dimensions = self
+            .field_value("HLL")
+            .and_then(|value| value.parse::<u32>().ok())
+            .zip(
+                self.field_value("VLL")
+                    .and_then(|value| value.parse::<u32>().ok()),
+            );
+        let bitonal = matches!(self.record_type, 5 | 6 | 8);
+        let rgb = matches!(self.record_type, 10 | 16 | 17)
+            && matches!(self.field_value("CSP"), Some("RGB" | "SRGB"));
+        let raw_size = dimensions.and_then(|(width, height)| {
+            let row_bytes = if bitonal {
+                u64::from(width).div_ceil(8)
+            } else {
+                u64::from(width) * if rgb { 3 } else { 1 }
+            };
+            row_bytes.checked_mul(u64::from(height))
+        });
+        let uncompressed = self
+            .compression_algorithm()
+            .unwrap_or("NONE")
+            .eq_ignore_ascii_case("NONE");
+        if uncompressed && raw_size == Some(data.len() as u64) {
+            let (width, height) = dimensions.context("Missing image dimensions")?;
+            ensure!(width > 0 && height > 0, "Image dimensions must be positive");
+            if bitonal {
+                let row_bytes = (width as usize).div_ceil(8);
+                return Ok(GrayImage::from_fn(width, height, |x, y| {
+                    let bit = (data[y as usize * row_bytes + x as usize / 8] >> (7 - x % 8)) & 1;
+                    Luma([if bit == 1 { 0 } else { 255 }])
+                })
+                .into());
+            }
+            if rgb {
+                return Ok(RgbImage::from_raw(width, height, data.clone())
+                    .context("Invalid RGB image size")?
+                    .into());
+            }
+            return Ok(GrayImage::from_raw(width, height, data.clone())
+                .context("Invalid grayscale image size")?
+                .into());
+        }
+        if data.starts_with(&[0xff, 0xa0]) {
+            return Ok(ImportedImage::decode(data)?.pixels);
+        }
+        image::load_from_memory(data).context("Cannot decode the embedded image for resizing")
+    }
 }
 
 impl NistFile {
+    /// Resize the actual embedded pixels and update image metadata and LEN/CNT.
+    /// Tagged records use lossless PNG; binary records use their raw pixel layout.
+    /// Leaves the complete file unchanged if decoding or validation fails.
+    pub fn resize_image(&mut self, record_index: usize, width: u32, height: u32) -> Result<()> {
+        ensure!(
+            self.warnings.is_empty(),
+            "Cannot edit an incompletely parsed file"
+        );
+        let record = self
+            .all_records()
+            .nth(record_index)
+            .context("No record selected")?;
+        record.validate_resize(width, height)?;
+        let pixels = record.decoded_image()?;
+        if (pixels.width(), pixels.height()) == (width, height) {
+            return Ok(());
+        }
+        // Normalize precision before allocating the resized image.
+        let pixels: DynamicImage = if matches!(
+            pixels.color(),
+            ColorType::L8 | ColorType::La8 | ColorType::L16 | ColorType::La16
+        ) {
+            DynamicImage::ImageLuma8(if pixels.color().has_alpha() {
+                DynamicImage::ImageRgb8(on_white(&pixels)).to_luma8()
+            } else {
+                pixels.to_luma8()
+            })
+        } else {
+            DynamicImage::ImageRgb8(on_white(&pixels))
+        };
+        let filter = if matches!(record.record_type, 5 | 6 | 8) {
+            image::imageops::FilterType::Nearest
+        } else {
+            image::imageops::FilterType::Lanczos3
+        };
+        let resized = pixels.resize_exact(width, height, filter);
+        let mut candidate = self.clone();
+        replace_record_image(
+            &mut candidate.records[record_index - 1],
+            ImportedImage {
+                pixels: resized,
+                format: None,
+                wsq: false,
+            },
+            &[],
+        )?;
+        candidate.recalculate()?;
+        *self = candidate;
+        Ok(())
+    }
+
     /// Replace an image, update its metadata and recalculate LEN/CNT atomically.
     /// `record_index` counts Type-1 as zero. Invalid input leaves this file intact.
     pub fn replace_image(&mut self, record_index: usize, bytes: &[u8]) -> Result<()> {

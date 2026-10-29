@@ -47,6 +47,7 @@ pub struct NistViewerApp {
     /// Last error message to show in the status bar.
     status: Option<String>,
     close_confirmed: bool,
+    resize_dialog: Option<ResizeDialog>,
 }
 
 /// A decoded image ready for rendering.
@@ -78,6 +79,42 @@ struct PendingDecode {
     record_index: usize,
     revision: u64,
     receiver: Receiver<Result<DecodedPixels>>,
+}
+
+struct ResizeDialog {
+    record_index: usize,
+    revision: u64,
+    original_width: u32,
+    original_height: u32,
+    width: u32,
+    height: u32,
+    keep_aspect: bool,
+    preview: egui::TextureHandle,
+    error: Option<String>,
+}
+
+impl ResizeDialog {
+    fn width_changed(&mut self) {
+        if self.keep_aspect {
+            self.height =
+                proportional_dimension(self.width, self.original_height, self.original_width);
+        }
+        self.error = None;
+    }
+
+    fn height_changed(&mut self) {
+        if self.keep_aspect {
+            self.width =
+                proportional_dimension(self.height, self.original_width, self.original_height);
+        }
+        self.error = None;
+    }
+}
+
+fn proportional_dimension(value: u32, numerator: u32, denominator: u32) -> u32 {
+    ((u64::from(value) * u64::from(numerator) + u64::from(denominator) / 2)
+        / u64::from(denominator.max(1)))
+    .clamp(1, u64::from(u32::MAX)) as u32
 }
 
 /// A loaded NIST file plus any cached per-record state.
@@ -162,6 +199,14 @@ impl LoadedFile {
         self.dirty = true;
         Ok(())
     }
+
+    fn resize_image(&mut self, index: usize, width: u32, height: u32) -> Result<()> {
+        let (mut candidate, _) = self.prepare_save()?;
+        candidate.resize_image(index, width, height)?;
+        self.commit(candidate);
+        self.dirty = true;
+        Ok(())
+    }
 }
 
 impl NistViewerApp {
@@ -174,6 +219,7 @@ impl NistViewerApp {
             pending_decode: None,
             status: None,
             close_confirmed: false,
+            resize_dialog: None,
         }
     }
 
@@ -220,6 +266,7 @@ impl NistViewerApp {
                 self.selected_record = 0;
                 self.zoom = 1.0;
                 self.pending_decode = None;
+                self.resize_dialog = None;
                 let warnings = nist.warnings.join("; ");
                 self.file = Some(LoadedFile::new(path.clone(), nist, size));
                 self.status = Some(if warnings.is_empty() {
@@ -477,6 +524,187 @@ impl NistViewerApp {
         }
     }
 
+    fn open_resize_dialog(&mut self, ctx: &egui::Context) {
+        let result = (|| -> Result<ResizeDialog> {
+            let file = self.file.as_ref().context("No NIST file loaded")?;
+            let (candidate, _) = file.prepare_save()?;
+            let record = candidate
+                .all_records()
+                .nth(self.selected_record)
+                .context("No record selected")?;
+            anyhow::ensure!(
+                record.can_replace_image(),
+                "Resizing is not supported for this record"
+            );
+            let pixels = record.decoded_image()?;
+            let (width, height) = (pixels.width(), pixels.height());
+            let limit = ctx.input(|input| input.max_texture_side).clamp(1, 320) as u32;
+            let (preview_width, preview_height) = scaled_size(width, height, limit);
+            let preview = pixels
+                .resize_exact(
+                    preview_width,
+                    preview_height,
+                    image::imageops::FilterType::Triangle,
+                )
+                .to_rgb8();
+            Ok(ResizeDialog {
+                record_index: self.selected_record,
+                revision: file.image_revisions[self.selected_record],
+                original_width: width,
+                original_height: height,
+                width,
+                height,
+                keep_aspect: true,
+                preview: ctx.load_texture(
+                    "resize-preview",
+                    rgb_to_color_image(&preview),
+                    egui::TextureOptions::LINEAR,
+                ),
+                error: None,
+            })
+        })();
+        match result {
+            Ok(dialog) => self.resize_dialog = Some(dialog),
+            Err(error) => self.status = Some(format!("Cannot resize image: {error:#}")),
+        }
+    }
+
+    fn render_resize_dialog(&mut self, ctx: &egui::Context) {
+        let Some(mut dialog) = self.resize_dialog.take() else {
+            return;
+        };
+        let mut apply = false;
+        let mut cancel = false;
+        let response = egui::Modal::new(egui::Id::new("resize-image")).show(ctx, |ui| {
+            ui.set_width(380.0);
+            ui.heading("Resize image");
+            ui.label(format!(
+                "Original: {} × {} pixels",
+                dialog.original_width, dialog.original_height
+            ));
+            let max_dimension = self
+                .file
+                .as_ref()
+                .and_then(|file| file.record(dialog.record_index))
+                .map_or(u32::MAX, |record| {
+                    if (3..=8).contains(&record.record_type) {
+                        u16::MAX as u32
+                    } else {
+                        u32::MAX
+                    }
+                });
+            ui.horizontal(|ui| {
+                ui.label("Width");
+                if ui
+                    .add(
+                        egui::DragValue::new(&mut dialog.width)
+                            .range(1..=max_dimension)
+                            .suffix(" px"),
+                    )
+                    .changed()
+                {
+                    dialog.width_changed();
+                }
+                ui.label("Height");
+                if ui
+                    .add(
+                        egui::DragValue::new(&mut dialog.height)
+                            .range(1..=max_dimension)
+                            .suffix(" px"),
+                    )
+                    .changed()
+                {
+                    dialog.height_changed();
+                }
+            });
+            if ui
+                .checkbox(&mut dialog.keep_aspect, "Keep aspect ratio")
+                .changed()
+                && dialog.keep_aspect
+            {
+                dialog.width_changed();
+            }
+            if ui.button("Reset dimensions").clicked() {
+                dialog.width = dialog.original_width;
+                dialog.height = dialog.original_height;
+                dialog.error = None;
+            }
+            ui.separator();
+            let (width, height) = scaled_size(dialog.width, dialog.height, 280);
+            ui.label("Preview");
+            if width > 0 && height > 0 {
+                ui.add(
+                    egui::Image::new(&dialog.preview)
+                        .fit_to_exact_size(Vec2::new(width as f32, height as f32)),
+                );
+            }
+            ui.label(format!(
+                "New size: {} × {} pixels",
+                dialog.width, dialog.height
+            ));
+            let validation = (|| -> Result<()> {
+                let file = self.file.as_ref().context("File is no longer open")?;
+                anyhow::ensure!(
+                    file.image_revisions.get(dialog.record_index) == Some(&dialog.revision),
+                    "Image changed; close and reopen Resize"
+                );
+                let record = file
+                    .record(dialog.record_index)
+                    .context("Record no longer exists")?;
+                ui.small(if (3..=8).contains(&record.record_type) {
+                    "Output: uncompressed pixels"
+                } else {
+                    "Output: PNG (lossless)"
+                });
+                record.validate_resize(dialog.width, dialog.height)
+            })();
+            ui.small(
+                "Scan resolution and annotations are kept. Save the NIST file after applying.",
+            );
+            if let Err(error) = &validation {
+                ui.colored_label(Color32::LIGHT_RED, error.to_string());
+            }
+            if let Some(error) = &dialog.error {
+                ui.colored_label(Color32::LIGHT_RED, error);
+            }
+            ui.separator();
+            ui.horizontal(|ui| {
+                let changed = (dialog.width, dialog.height)
+                    != (dialog.original_width, dialog.original_height);
+                apply = ui
+                    .add_enabled(
+                        validation.is_ok() && changed,
+                        egui::Button::new("Apply resize"),
+                    )
+                    .clicked();
+                cancel = ui.button("Cancel").clicked();
+            });
+        });
+        if cancel || response.should_close() {
+            return;
+        }
+        if apply {
+            match self.apply_image_resize(dialog.record_index, dialog.width, dialog.height) {
+                Ok(()) => return,
+                Err(error) => dialog.error = Some(format!("Cannot resize image: {error:#}")),
+            }
+        }
+        self.resize_dialog = Some(dialog);
+    }
+
+    fn apply_image_resize(&mut self, index: usize, width: u32, height: u32) -> Result<()> {
+        self.file
+            .as_mut()
+            .context("No NIST file loaded")?
+            .resize_image(index, width, height)?;
+        self.zoom = 1.0;
+        self.ensure_selected_image_decoded();
+        self.status = Some(format!(
+            "Resized image to {width} × {height} pixels. Metadata and lengths updated; save the NIST file to keep the change."
+        ));
+        Ok(())
+    }
+
     /// Saves a validated copy and only commits edits after the write succeeds.
     fn save_nist_file(&mut self, save_as: bool) -> bool {
         let Some(file) = self.file.as_ref() else {
@@ -572,7 +800,10 @@ impl eframe::App for NistViewerApp {
         CentralPanel::default().show(ui, |ui| {
             self.render_central(ui);
         });
-        self.handle_shortcuts(ui, &ctx);
+        self.render_resize_dialog(&ctx);
+        if self.resize_dialog.is_none() {
+            self.handle_shortcuts(ui, &ctx);
+        }
 
         // Request repaint while a decode is in flight.
         if self.pending_decode.is_some() {
@@ -662,6 +893,13 @@ impl NistViewerApp {
                         .clicked()
                     {
                         self.replace_image_dialog();
+                        ui.close();
+                    }
+                    if ui
+                        .add_enabled(can_replace, egui::Button::new("Resize image…"))
+                        .clicked()
+                    {
+                        self.open_resize_dialog(ui.ctx());
                         ui.close();
                     }
                     ui.separator();
@@ -825,6 +1063,7 @@ impl NistViewerApp {
 
         let mut decode_clicked = false;
         let mut replace_clicked = false;
+        let mut resize_clicked = false;
         ui.horizontal(|ui| {
             if ui.button("Decode image").clicked() {
                 decode_clicked = true;
@@ -834,6 +1073,12 @@ impl NistViewerApp {
                 .clicked()
             {
                 replace_clicked = true;
+            }
+            if ui
+                .add_enabled(can_replace, egui::Button::new("Resize image…"))
+                .clicked()
+            {
+                resize_clicked = true;
             }
             ui.label(format!("Compression: {compression}"));
             if let Some((hll, vll)) = native_size {
@@ -845,6 +1090,9 @@ impl NistViewerApp {
         }
         if replace_clicked {
             self.replace_image_dialog();
+        }
+        if resize_clicked {
+            self.open_resize_dialog(ui.ctx());
         }
 
         ui.separator();
@@ -1610,5 +1858,123 @@ mod tests {
             app.pending_decode.is_some(),
             "manual Decode must allow retrying"
         );
+    }
+
+    #[test]
+    fn resize_dialog_keeps_aspect_ratio_from_either_dimension_and_allows_unlocking() {
+        let mut app = NistViewerApp::new();
+        app.file = Some(loaded_fixture());
+        app.selected_record = app
+            .file
+            .as_ref()
+            .unwrap()
+            .nist
+            .all_records()
+            .position(NistRecord::can_replace_image)
+            .unwrap();
+        let ctx = egui::Context::default();
+        ctx.run_ui(egui::RawInput::default(), |_| app.open_resize_dialog(&ctx))
+            .drop_without_applying_deltas();
+        let dialog = app.resize_dialog.as_mut().unwrap();
+        dialog.width = dialog.original_width * 2;
+        dialog.width_changed();
+        assert_eq!(dialog.height, dialog.original_height * 2);
+        dialog.height = dialog.original_height * 3;
+        dialog.height_changed();
+        assert_eq!(dialog.width, dialog.original_width * 3);
+        dialog.keep_aspect = false;
+        dialog.width = 100;
+        dialog.height = 50;
+        dialog.width_changed();
+        assert_eq!(dialog.height, 50);
+        dialog.height = 70;
+        dialog.height_changed();
+        assert_eq!(dialog.width, 100);
+        assert_eq!(proportional_dimension(1, 1, 1000), 1);
+    }
+
+    #[test]
+    fn cancelling_resize_dialog_keeps_the_image_and_pending_field_edits() {
+        let mut app = NistViewerApp::new();
+        let mut file = loaded_fixture();
+        file.field_drafts
+            .insert((0, 9), "pending transaction".into());
+        file.dirty = true;
+        let before = file.nist.to_bytes().unwrap();
+        app.selected_record = file
+            .nist
+            .all_records()
+            .position(NistRecord::can_replace_image)
+            .unwrap();
+        app.file = Some(file);
+        let ctx = egui::Context::default();
+        ctx.run_ui(egui::RawInput::default(), |_| {
+            app.open_resize_dialog(&ctx);
+            let dialog = app.resize_dialog.as_mut().unwrap();
+            dialog.width = 10;
+            dialog.height = 20;
+            app.render_resize_dialog(&ctx);
+        })
+        .drop_without_applying_deltas();
+        assert!(app.resize_dialog.is_some());
+        let input = egui::RawInput {
+            events: vec![egui::Event::Key {
+                key: egui::Key::Escape,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Default::default(),
+            }],
+            ..Default::default()
+        };
+        ctx.run_ui(input, |_| app.render_resize_dialog(&ctx))
+            .drop_without_applying_deltas();
+        assert!(app.resize_dialog.is_none());
+        let file = app.file.as_mut().unwrap();
+        assert_eq!(file.nist.to_bytes().unwrap(), before);
+        assert_eq!(file.field_drafts[&(0, 9)], "pending transaction");
+        assert!(file.dirty);
+    }
+
+    #[test]
+    fn applying_resize_refreshes_preview_and_saves_dimensions_with_pending_metadata() {
+        let mut app = NistViewerApp::new();
+        let mut file = loaded_fixture();
+        let directory = tempfile::tempdir().unwrap();
+        file.path = directory.path().join("resized.an2");
+        file.field_drafts
+            .insert((0, 9), "resized transaction".into());
+        let index = file
+            .nist
+            .all_records()
+            .position(NistRecord::can_replace_image)
+            .unwrap();
+        app.selected_record = index;
+        app.file = Some(file);
+        assert!(app.apply_image_resize(index, 0, 10).is_err());
+        assert_eq!(
+            app.file.as_ref().unwrap().field_drafts[&(0, 9)],
+            "resized transaction"
+        );
+        app.apply_image_resize(index, 40, 20).unwrap();
+        assert!(app.file.as_ref().unwrap().dirty);
+        assert!(app.file.as_ref().unwrap().field_drafts.is_empty());
+        let ctx = egui::Context::default();
+        complete_preview(&mut app, &ctx);
+        let decoded = app.file.as_ref().unwrap().image_cache[index]
+            .as_ref()
+            .unwrap();
+        assert_eq!((decoded.width, decoded.height), (40, 20));
+        assert!(app.save_nist_file(false));
+        assert!(app.file.as_ref().unwrap().image_cache[index].is_some());
+        let file = app.file.as_ref().unwrap();
+        let (saved, _) = load_nist_file(&file.path).unwrap();
+        assert_eq!(
+            saved.transaction.field_value("TCN"),
+            Some("resized transaction")
+        );
+        let record = saved.all_records().nth(index).unwrap();
+        let pixels = record.decoded_image().unwrap();
+        assert_eq!((pixels.width(), pixels.height()), (40, 20));
     }
 }
