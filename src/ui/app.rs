@@ -651,7 +651,9 @@ impl NistViewerApp {
                 let record = file
                     .record(dialog.record_index)
                     .context("Record no longer exists")?;
-                ui.small(if (3..=8).contains(&record.record_type) {
+                ui.small(if record.is_wsq_image() {
+                    "Output: WSQ (original format)"
+                } else if (3..=8).contains(&record.record_type) {
                     "Output: uncompressed pixels"
                 } else {
                     "Output: PNG (lossless)"
@@ -1976,5 +1978,38 @@ mod tests {
         let record = saved.all_records().nth(index).unwrap();
         let pixels = record.decoded_image().unwrap();
         assert_eq!((pixels.width(), pixels.height()), (40, 20));
+    }
+
+    #[test]
+    fn applying_wsq_resize_keeps_wsq_through_preview_and_file_save() {
+        let mut app = NistViewerApp::new();
+        app.load_file(PathBuf::from("test_data/type-14-amp-nqm-utf8.an2"));
+        let directory = tempfile::tempdir().unwrap();
+        let file = app.file.as_mut().unwrap();
+        file.path = directory.path().join("resized-wsq.an2");
+        let index = file
+            .nist
+            .all_records()
+            .position(NistRecord::can_replace_image)
+            .unwrap();
+        app.selected_record = index;
+        app.apply_image_resize(index, 256, 192).unwrap();
+        let ctx = egui::Context::default();
+        complete_preview(&mut app, &ctx);
+        let file = app.file.as_ref().unwrap();
+        let decoded = file.image_cache[index].as_ref().unwrap();
+        assert_eq!((decoded.width, decoded.height), (256, 192));
+        assert_eq!(decoded.source, "WSQ");
+        assert!(app.save_nist_file(false));
+        let (saved, _) = load_nist_file(&app.file.as_ref().unwrap().path).unwrap();
+        let record = saved.all_records().nth(index).unwrap();
+        assert!(record.is_wsq_image());
+        assert_eq!(record.compression_algorithm(), Some("WSQ20"));
+        assert_eq!(
+            crate::wsq::decode(record.image_data.as_ref().unwrap())
+                .unwrap()
+                .width,
+            256
+        );
     }
 }

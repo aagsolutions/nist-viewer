@@ -53,21 +53,21 @@ const Q_TREELEN: usize = 64;
 const NUM_SUBBANDS: usize = 60;
 
 #[derive(Debug, Clone, Default)]
-struct WaveletTree {
-    x: i32,
-    y: i32,
-    lenx: i32,
-    leny: i32,
-    invrw: i32,
-    invcl: i32,
+pub(super) struct WaveletTree {
+    pub(super) x: i32,
+    pub(super) y: i32,
+    pub(super) lenx: i32,
+    pub(super) leny: i32,
+    pub(super) invrw: i32,
+    pub(super) invcl: i32,
 }
 
 #[derive(Debug, Clone, Default)]
-struct QuantTree {
-    x: i32,
-    y: i32,
-    lenx: i32,
-    leny: i32,
+pub(super) struct QuantTree {
+    pub(super) x: i32,
+    pub(super) y: i32,
+    pub(super) lenx: i32,
+    pub(super) leny: i32,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -590,6 +590,14 @@ fn build_q_trees(token: &mut Token) {
     qtree16(&mut qtree, 35, w[5].lenx, w[5].leny, w[5].x, w[5].y, 1, 0);
     qtree4(&mut qtree, 0, w[19].lenx, w[19].leny, w[19].x, w[19].y);
     token.qtree = qtree;
+}
+
+/// Share the WSQ decomposition layout with the encoder without exposing parser state.
+pub(super) fn encoding_trees(width: u32, height: u32) -> (Vec<WaveletTree>, Vec<QuantTree>) {
+    let mut token = Token::new(Vec::new());
+    build_w_trees(&mut token, width, height);
+    build_q_trees(&mut token);
+    (token.wtree, token.qtree)
 }
 
 fn qtree16(

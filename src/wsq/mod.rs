@@ -20,7 +20,7 @@
  * OTHER DEALINGS IN THE SOFTWARE.
  */
 
-//! Pure-Rust WSQ (Wavelet Scalar Quantization) decoder.
+//! Pure-Rust WSQ (Wavelet Scalar Quantization) encoding and decoding.
 //!
 //! Implements enough of the WSQ 3.1 spec to render the grayscale fingerprint
 //! images used by the FBI and most NIST files. The algorithm is ported from
@@ -28,6 +28,7 @@
 //! [`jnbis`](https://github.com/mhshams/jnbis).
 
 pub mod decoder;
+pub mod encoder;
 pub mod header;
 
 pub use decoder::{decode, DecodedWsq};

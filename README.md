@@ -34,7 +34,7 @@ It parses traditional encoding, lists all logical records in the file, shows rec
 
 ## Building & Running
 
-Requires a recent stable Rust toolchain.
+Requires a recent stable Rust toolchain. The WSQ encoder and decoder are implemented in safe Rust, with no WSQ C library, FFI, or native build step.
 
 ```bash
 cargo run --release
@@ -57,7 +57,7 @@ The character set declaration (`DCS`) and detected binary compression are read-o
 Select an image record and click **Replace image…**, or use **Image ▸ Replace image…**. Choose a JPEG, PNG, WSQ, BMP, or TIFF file. The replacement updates the preview, dimensions (`HLL`/`VLL`), compression (`CGA`/`GCA`), bit depth and color space where applicable, and record lengths. Pending field edits are applied together with the image. Save the NIST file to keep the replacement; importing does not modify the source image file.
 
 - Type-10 and Type-13–17 records retain compatible JPEG/PNG images. Other raster formats, transparency, and required color conversions are normalized to an 8-bit PNG. Fingerprint and palm images are converted to grayscale; transparency is composited onto white.
-- Type-3/4 records store raster imports as uncompressed 8-bit grayscale. Imported WSQ files remain WSQ in Type-3/4 and Type-13–16 records; the app does not encode new WSQ files.
+- Type-3/4 records store raster imports as uncompressed 8-bit grayscale. Imported WSQ files remain WSQ in Type-3/4 and Type-13–16 records.
 - Type-5/6 and Type-8 records store uncompressed one-bit images using a grayscale threshold of 128. Signature representation (`SRT`) is updated accordingly. Binary image dimensions must fit the 16-bit header.
 
 Replacement supports Type-3–6, Type-8, Type-10, and Type-13–17 image records. Custom Type-7 payloads and other record layouts are not replaced. Existing scan resolution, capture details, quality scores, annotations, and related minutiae records are retained; review these when using a different image, since they are not inferred or recomputed from its pixels.
@@ -68,7 +68,9 @@ Select an image record and click **Resize image…**, or choose **Image ▸ Resi
 
 Click **Apply resize** to resample the embedded pixels, refresh the preview, and recalculate image metadata and `LEN`/`CNT`. Save or Save As to write the resized image into the NIST file. Smooth images use Lanczos resampling; one-bit fingerprint and signature images use nearest-neighbor resampling to retain black/white pixels.
 
-Resized Type-10/13–17 images are stored as lossless 8-bit PNG, including images originally compressed as WSQ or JPEG. Legacy Type-3/4 records store raw grayscale; Type-5/6/8 records store packed one-bit pixels. Keeping the original dimensions preserves the original encoded image. Scan resolution and image annotations are retained and should be reviewed after resizing.
+**WSQ images remain WSQ after resizing**, in tagged records (`CGA=WSQ20`) and legacy Type-3/4 records (binary `GCA=1`). The [pure Rust WSQ encoder](src/wsq/encoder.rs) retains the source PPI and usable compression bitrate, defaulting to 0.75 bits/pixel when no bitrate is available. It implements wavelet decomposition, scalar quantization, canonical Huffman coding, and WSQ serialization directly in Rust. No external WSQ installation is needed. Re-encoding WSQ is lossy. Supported dimensions are 128–65,535 pixels per axis; unsupported dimensions or encoding errors leave the original image unchanged and never fall back to PNG.
+
+Other resized Type-10/13–17 images are stored as lossless 8-bit PNG. Non-WSQ legacy Type-3/4 images store raw grayscale; Type-5/6/8 records store packed one-bit pixels. Keeping the original dimensions preserves the original encoded image. Scan resolution and image annotations are retained and should be reviewed after resizing.
 
 ## Testing
 
@@ -90,4 +92,4 @@ cargo run --example debug_decode -- test_data/type-14-amp-nqm-utf8.an2
 
 ## License
 
-The WSQ decode algorithm is derived from the public-domain NIST NBIS reference implementation.
+The Rust WSQ codec follows the public-domain NIST NBIS algorithms; its original notice is retained in [`src/wsq/NOTICE`](src/wsq/NOTICE). Independently decoded compatibility fixtures and their provenance are in [`test_data/wsq_encoder/`](test_data/wsq_encoder/README.md). Builds and tests do not compile or invoke native WSQ code.

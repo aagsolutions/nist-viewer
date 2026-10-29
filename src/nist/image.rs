@@ -15,6 +15,45 @@ impl NistRecord {
         self.image_data.is_some() && matches!(self.record_type, 3..=6 | 8 | 10 | 13..=17)
     }
 
+    /// Whether the actual embedded image uses WSQ compression.
+    pub fn is_wsq_image(&self) -> bool {
+        let Some(data) = &self.image_data else {
+            return false;
+        };
+        if !data.starts_with(&[0xff, 0xa0]) {
+            return false;
+        }
+        // Raw grayscale samples can coincidentally start with a WSQ marker.
+        if self
+            .compression_algorithm()
+            .is_some_and(|value| value.eq_ignore_ascii_case("NONE"))
+        {
+            let raw_size = self
+                .field_value("HLL")
+                .and_then(|value| value.parse::<u64>().ok())
+                .zip(
+                    self.field_value("VLL")
+                        .and_then(|value| value.parse::<u64>().ok()),
+                )
+                .and_then(|(width, height)| {
+                    let row_bytes = if matches!(self.record_type, 5 | 6 | 8) {
+                        width.div_ceil(8)
+                    } else if matches!(self.record_type, 10 | 16 | 17)
+                        && matches!(self.field_value("CSP"), Some("RGB" | "SRGB"))
+                    {
+                        width.checked_mul(3)?
+                    } else {
+                        width
+                    };
+                    row_bytes.checked_mul(height)
+                });
+            if raw_size == Some(data.len() as u64) {
+                return false;
+            }
+        }
+        true
+    }
+
     /// Validate resize dimensions before allocating pixels or changing a record.
     pub fn validate_resize(&self, width: u32, height: u32) -> Result<()> {
         ensure!(
@@ -26,6 +65,20 @@ impl NistRecord {
             width > 0 && height > 0,
             "Width and height must be greater than zero"
         );
+        if self.is_wsq_image() {
+            ensure!(
+                matches!(self.record_type, 3 | 4 | 13..=16),
+                "This record type cannot store a resized WSQ image"
+            );
+            let minimum = crate::wsq::encoder::MIN_ENCODE_DIMENSION;
+            ensure!(
+                width >= minimum
+                    && height >= minimum
+                    && width <= u16::MAX as u32
+                    && height <= u16::MAX as u32,
+                "WSQ resizing supports dimensions from {minimum} to 65535 pixels; the original image is kept for unsupported sizes"
+            );
+        }
         if (3..=8).contains(&self.record_type) {
             ensure!(
                 width <= u16::MAX as u32 && height <= u16::MAX as u32,
@@ -101,7 +154,7 @@ impl NistRecord {
 
 impl NistFile {
     /// Resize the actual embedded pixels and update image metadata and LEN/CNT.
-    /// Tagged records use lossless PNG; binary records use their raw pixel layout.
+    /// WSQ sources remain WSQ. Other tagged images use PNG, binary images raw pixels.
     /// Leaves the complete file unchanged if decoding or validation fails.
     pub fn resize_image(&mut self, record_index: usize, width: u32, height: u32) -> Result<()> {
         ensure!(
@@ -113,7 +166,19 @@ impl NistFile {
             .nth(record_index)
             .context("No record selected")?;
         record.validate_resize(width, height)?;
-        let pixels = record.decoded_image()?;
+        let source_wsq = if record.is_wsq_image() {
+            Some(crate::wsq::decode(record.image_data.as_ref().unwrap())?)
+        } else {
+            None
+        };
+        let pixels = if let Some(source) = &source_wsq {
+            DynamicImage::ImageLuma8(
+                GrayImage::from_raw(source.width, source.height, source.pixels.clone())
+                    .context("Invalid WSQ dimensions")?,
+            )
+        } else {
+            record.decoded_image()?
+        };
         if (pixels.width(), pixels.height()) == (width, height) {
             return Ok(());
         }
@@ -136,15 +201,26 @@ impl NistFile {
             image::imageops::FilterType::Lanczos3
         };
         let resized = pixels.resize_exact(width, height, filter);
+        let encoded_wsq = if let Some(source) = source_wsq {
+            Some(crate::wsq::encoder::encode(
+                resized.to_luma8().as_raw(),
+                width,
+                height,
+                source.ppi,
+                crate::wsq::encoder::source_bitrate(record.image_data.as_ref().unwrap()),
+            )?)
+        } else {
+            None
+        };
         let mut candidate = self.clone();
         replace_record_image(
             &mut candidate.records[record_index - 1],
             ImportedImage {
                 pixels: resized,
                 format: None,
-                wsq: false,
+                wsq: encoded_wsq.is_some(),
             },
-            &[],
+            encoded_wsq.as_deref().unwrap_or(&[]),
         )?;
         candidate.recalculate()?;
         *self = candidate;

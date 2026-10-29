@@ -55,16 +55,20 @@ fn bundled_images_resize_and_reopen_with_correct_pixels_metadata_and_lengths() {
             .map(|record| record.image_data.clone())
             .collect();
         let original_cnt = file.transaction.field_value("CNT").unwrap().to_string();
-        file.resize_image(index, 13, 7).unwrap();
+        let wsq = file.all_records().nth(index).unwrap().is_wsq_image();
+        let (width, height) = if wsq { (256, 192) } else { (13, 7) };
+        file.resize_image(index, width, height).unwrap();
         let saved = reopen(&mut file);
         let record = saved.all_records().nth(index).unwrap();
         let pixels = record.decoded_image().unwrap();
-        assert_eq!((pixels.width(), pixels.height()), (13, 7), "{name}");
-        assert_eq!(record.field_value("HLL"), Some("13"));
-        assert_eq!(record.field_value("VLL"), Some("7"));
+        assert_eq!((pixels.width(), pixels.height()), (width, height), "{name}");
+        assert_eq!(record.field_value("HLL"), Some(width.to_string().as_str()));
+        assert_eq!(record.field_value("VLL"), Some(height.to_string().as_str()));
         assert_eq!(
             record.compression_algorithm(),
-            Some(if record.record_type <= 8 {
+            Some(if wsq {
+                "WSQ20"
+            } else if record.record_type <= 8 {
                 "NONE"
             } else {
                 "PNG"
@@ -113,30 +117,31 @@ fn upscaling_retains_color_and_updates_the_actual_saved_image() {
 }
 
 #[test]
-fn resized_wsq_uses_png_or_legacy_raw_and_updates_the_binary_compression_byte() {
+fn resized_wsq_stays_wsq_and_updates_the_binary_compression_byte() {
     let wsq = std::fs::read("test_data/sample.wsq").unwrap();
     for name in ["type-3.an2", "type-14-amp-nqm-utf8.an2"] {
         let mut file = fixture(name);
         let index = image_index(&file);
         file.replace_image(index, &wsq).unwrap();
-        file.resize_image(index, 40, 50).unwrap();
+        file.resize_image(index, 256, 192).unwrap();
         let bytes = file.to_bytes().unwrap();
         let saved = reopen(&mut file);
         let record = saved.all_records().nth(index).unwrap();
         assert_eq!(
             record.decoded_image().unwrap().to_luma8().dimensions(),
-            (40, 50)
+            (256, 192)
         );
+        let payload = record.image_data.as_ref().unwrap();
+        assert!(payload.starts_with(&[0xff, 0xa0]));
+        assert!(payload.ends_with(&[0xff, 0xa1]));
+        assert_eq!(record.compression_algorithm(), Some("WSQ20"));
         if record.record_type == 3 {
             let offset: usize = saved
                 .all_records()
                 .take(index)
                 .map(|r| r.field_value("LEN").unwrap().parse::<usize>().unwrap())
                 .sum();
-            assert_eq!(bytes[offset + 17], 0);
-            assert_eq!(record.compression_algorithm(), Some("NONE"));
-        } else {
-            assert_eq!(record.compression_algorithm(), Some("PNG"));
+            assert_eq!(bytes[offset + 17], 1);
         }
     }
 }
@@ -211,4 +216,34 @@ fn decoding_failure_keeps_pixels_and_calculated_fields_unchanged() {
     let before = file.to_bytes().unwrap();
     assert!(file.resize_image(index, 10, 10).is_err());
     assert_eq!(file.to_bytes().unwrap(), before);
+}
+
+#[test]
+fn unsupported_wsq_sizes_keep_the_original_stream_without_png_fallback() {
+    let mut file = fixture("type-14-amp-nqm-utf8.an2");
+    let index = image_index(&file);
+    assert!(file.all_records().nth(index).unwrap().is_wsq_image());
+    let before = file.to_bytes().unwrap();
+    for (width, height) in [(0, 256), (127, 256), (256, 127), (65536, 256)] {
+        assert!(file.resize_image(index, width, height).is_err());
+        assert_eq!(file.to_bytes().unwrap(), before);
+    }
+}
+
+#[test]
+fn raw_pixels_resembling_a_wsq_header_are_not_converted_to_wsq() {
+    let mut file = fixture("type-3.an2");
+    let index = image_index(&file);
+    let pixels = GrayImage::from_raw(8, 1, vec![0xff, 0xa0, 0, 100, 200, 10, 20, 30]).unwrap();
+    file.replace_image(index, &png(pixels)).unwrap();
+    assert!(!file.all_records().nth(index).unwrap().is_wsq_image());
+    file.resize_image(index, 13, 7).unwrap();
+    assert_eq!(
+        reopen(&mut file)
+            .all_records()
+            .nth(index)
+            .unwrap()
+            .compression_algorithm(),
+        Some("NONE")
+    );
 }
