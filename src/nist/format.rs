@@ -22,16 +22,16 @@
 
 //! Format constants and helper utilities for the NIST biometric file format.
 
-/// ASCII Record Separator — separates logical records.
+/// ASCII Record Separator — separates subfields within a field.
 pub const RECORD_SEPARATOR: u8 = 0x1E;
 
-/// ASCII Unit Separator — separates fields within a record.
+/// ASCII Unit Separator — separates information items within a subfield.
 pub const UNIT_SEPARATOR: u8 = 0x1F;
 
-/// ASCII Group Separator — used inside records to separate groups of fields.
+/// ASCII Group Separator — separates fields within a tagged record.
 pub const GROUP_SEPARATOR: u8 = 0x1D;
 
-/// ASCII File/Field Separator — terminates a logical record.
+/// ASCII File Separator — terminates a tagged logical record.
 pub const FIELD_SEPARATOR: u8 = 0x1C;
 
 /// Returns `true` if the byte is one of the four NIST separator characters.

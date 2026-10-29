@@ -9,7 +9,7 @@
  *
  * The above copyright notice and this permission notice shall be included in all
  * copies or substantial portions of the Software.
- *  
+ *
  * THE SOFTWARE IS PROVIDED “AS IS”, WITHOUT WARRANTY OF ANY KIND,
  * EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
  * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
@@ -31,6 +31,8 @@ pub struct TextField {
     pub code: String,
     /// The textual value associated with the field.
     pub value: String,
+    /// Original encoded value, retained to preserve unchanged text byte for byte.
+    pub(crate) original_value: Option<(String, Vec<u8>)>,
 }
 
 impl TextField {
@@ -39,7 +41,14 @@ impl TextField {
             field,
             code: code.into(),
             value: value.into(),
+            original_value: None,
         }
+    }
+
+    pub(crate) fn parsed(field: u16, code: impl Into<String>, value: String, raw: Vec<u8>) -> Self {
+        let mut result = Self::new(field, code, value.clone());
+        result.original_value = Some((value, raw));
+        result
     }
 }
 
@@ -60,6 +69,8 @@ pub struct NistRecord {
     pub fields: Vec<TextField>,
     /// The raw binary image payload for image records (`None` for pure-text records).
     pub image_data: Option<Vec<u8>>,
+    /// Original fixed header, including bytes not interpreted by the viewer.
+    pub(crate) binary_header: Option<Vec<u8>>,
 }
 
 impl NistRecord {
@@ -73,7 +84,6 @@ impl NistRecord {
 
     /// Returns the named compression algorithm (when present, e.g. `WSQ20`, `JPEGB`, `JPEGL`, `PNG`).
     pub fn compression_algorithm(&self) -> Option<&str> {
-        self.field_value("CGA")
-            .or_else(|| self.field_value("GCA"))
+        self.field_value("CGA").or_else(|| self.field_value("GCA"))
     }
 }

@@ -22,7 +22,7 @@
 
 //! Streaming-style parser for ANSI/NIST-ITL Traditional Encoding files.
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 
 use super::format::*;
 use super::records::{NistRecord, TextField};
@@ -36,6 +36,8 @@ pub struct NistFile {
     pub records: Vec<NistRecord>,
     /// Bytes consumed from the input. Useful for diagnostic messages.
     pub bytes_read: usize,
+    /// Problems recovered from while viewing. Saving is disabled to avoid data loss.
+    pub warnings: Vec<String>,
 }
 
 impl NistFile {
@@ -55,7 +57,7 @@ impl NistFile {
 /// Charset decoder strategy for the textual fields. Mirrors the values declared
 /// in the Type-1 `DCS` field.
 #[derive(Debug, Clone, Copy)]
-enum Charset {
+pub(super) enum Charset {
     /// Default — Latin/Windows codepage (matches NIST's "000" default).
     DEFAULT,
     /// UTF-16 (`002`).
@@ -117,16 +119,9 @@ impl<'a> Cursor<'a> {
 }
 
 /// Decode a byte sequence with the configured charset into `String`.
-fn decode_charset(bytes: &[u8], charset: Charset) -> String {
+pub(super) fn decode_charset(bytes: &[u8], charset: Charset) -> String {
     match charset {
-        Charset::DEFAULT => {
-            // NIST files in their default charset are 7-bit ASCII compatible.
-            // Replace any non-ASCII byte with '?' so the GUI never crashes.
-            bytes
-                .iter()
-                .map(|&b| if b < 0x80 { b as char } else { '?' })
-                .collect()
-        }
+        Charset::DEFAULT => bytes.iter().map(|&b| char::from(b)).collect(),
         Charset::UTF8 => String::from_utf8_lossy(bytes).into_owned(),
         Charset::UTF16 => {
             // UTF-16 LE with optional BOM. If we have an odd number of bytes we
@@ -135,29 +130,22 @@ fn decode_charset(bytes: &[u8], charset: Charset) -> String {
             if slice.starts_with(&[0xFF, 0xFE]) {
                 slice = &slice[2..];
             }
-            let mut out = String::with_capacity(slice.len() / 2);
-            let mut chunks = slice.chunks_exact(2);
-            for chunk in &mut chunks {
-                let c = u16::from_le_bytes([chunk[0], chunk[1]]);
-                if let Some(ch) = char::from_u32(c as u32) {
-                    out.push(ch);
-                }
-            }
-            out
+            let units: Vec<u16> = slice
+                .chunks_exact(2)
+                .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+                .collect();
+            String::from_utf16_lossy(&units)
         }
     }
 }
 
 /// Parse a `crt.field:value` tag from the cursor.
 ///
-/// `value_term` is the byte that ends the value portion (e.g. `GROUP_SEPARATOR`
-/// for sub-fields or `FIELD_SEPARATOR` / `RECORD_SEPARATOR` for the last value
-/// in a record).
 /// Returns `(record_type, field, value, value_start)`
 /// where `value_start` is the byte offset where the value began. Callers
 /// need this for the binary `999` field, where reading ahead looking for
 /// separators is unreliable (binary data may contain them by chance).
-fn read_tag(cursor: &mut Cursor<'_>) -> Result<(u8, u16, Vec<u8>, usize)> {
+fn read_tag(cursor: &mut Cursor<'_>, charset: Charset) -> Result<(u8, u16, Vec<u8>, usize)> {
     let type_bytes = cursor.read_until(&[b'.']);
     if cursor.peek() != Some(b'.') {
         bail!(
@@ -178,14 +166,34 @@ fn read_tag(cursor: &mut Cursor<'_>) -> Result<(u8, u16, Vec<u8>, usize)> {
         .trim()
         .parse()
         .context("field tag is not a number")?;
-    if cursor.peek() == Some(b':') {
-        cursor.pos += 1; // consume the ':'
+    if cursor.peek() != Some(b':') {
+        bail!("expected ':' in field tag at byte {}", cursor.pos);
     }
+    cursor.pos += 1;
     // A value may itself contain RS (0x1E) / US (0x1F) separators — for
     // example the Type-1 `CNT` field lists `type<US>count` entries separated
     // by RS. Only GS / FS actually terminate a value inside a record.
     let value_start = cursor.pos;
-    let value = cursor.read_until(&[GROUP_SEPARATOR, FIELD_SEPARATOR]);
+    let value = if field == 999 {
+        // The caller extracts binary data by LEN, never by scanning its bytes.
+        Vec::new()
+    } else if matches!(charset, Charset::UTF16) && crt != 1 && field > 2 {
+        let next_tag = format!("{crt}.");
+        while cursor.pos < cursor.bytes.len() {
+            let rest = &cursor.bytes[cursor.pos..];
+            if rest == [FIELD_SEPARATOR]
+                || (rest[0] == GROUP_SEPARATOR && rest[1..].starts_with(next_tag.as_bytes()))
+            {
+                break;
+            }
+            // Advance by code units so separator-valued bytes within a UTF-16
+            // character cannot split a field.
+            cursor.read_n(2)?;
+        }
+        cursor.bytes[value_start..cursor.pos].to_vec()
+    } else {
+        cursor.read_until(&[GROUP_SEPARATOR, FIELD_SEPARATOR])
+    };
     Ok((crt, field, value, value_start))
 }
 
@@ -197,16 +205,18 @@ fn read_type1(cursor: &mut Cursor<'_>) -> Result<(NistRecord, Charset)> {
         idc: 0,
         fields: Vec::new(),
         image_data: None,
+        binary_header: None,
     };
     let mut charset = Charset::DEFAULT;
     loop {
-        let (crt, field, value, _value_start) = read_tag(cursor)
+        let (crt, field, value, _value_start) = read_tag(cursor, Charset::DEFAULT)
             .with_context(|| format!("Type-1 parsing at position {}", cursor.pos))?;
         if crt != 1 {
             bail!("expected Type-1 tag, got Type-{}", crt);
         }
-        let decoded = decode_charset(&value, charset);
-        record.fields.push(TextField::new(field, code_for(1, field), decoded));
+        // Type-1 values remain ASCII, including the directory declaring the
+        // character set used in subsequent records.
+        let decoded = decode_charset(&value, Charset::DEFAULT);
         if field == 15 {
             // DCS — Directory of Character Sets
             if value.starts_with(b"002") {
@@ -215,6 +225,9 @@ fn read_type1(cursor: &mut Cursor<'_>) -> Result<(NistRecord, Charset)> {
                 charset = Charset::UTF8;
             }
         }
+        record
+            .fields
+            .push(TextField::parsed(field, code_for(1, field), decoded, value));
         match cursor.peek() {
             Some(FIELD_SEPARATOR) => {
                 cursor.pos += 1;
@@ -255,6 +268,8 @@ fn code_for(record_type: u8, field: u16) -> String {
         (1, 17) => "ANM",
         (1, 18) => "GNS",
         // Type-2
+        (2, 1) => "LEN",
+        (2, 2) => "IDC",
         (2, _) => "UTF",
         // Type-9
         (9, 1) => "LEN",
@@ -313,90 +328,79 @@ fn code_for(record_type: u8, field: u16) -> String {
 
 /// Parse a text-style record (everything except Types 3-8). The first tag is
 /// always `LEN` whose value gives the total byte length of the record.
-fn read_text_record(cursor: &mut Cursor<'_>, record_type: u8, charset: Charset) -> Result<NistRecord> {
-    // First tag must be LEN (field 1)
+fn read_text_record(
+    cursor: &mut Cursor<'_>,
+    record_type: u8,
+    charset: Charset,
+) -> Result<NistRecord> {
     let record_start = cursor.pos;
-    let (crt, field, value, _value_start) = read_tag(cursor)
-        .with_context(|| format!("Type-{} at position {}", record_type, cursor.pos))?;
-    if crt != record_type {
-        bail!("expected Type-{}, got Type-{}", record_type, crt);
+    let (crt, field, value, _) = read_tag(cursor, Charset::DEFAULT)?;
+    if crt != record_type || field != 1 {
+        bail!("expected Type-{record_type} LEN as the first field");
     }
-    if field != 1 {
-        bail!("first field of a text record must be LEN (1), got {}", field);
-    }
-    let length: usize = std::str::from_utf8(&value)
-        .context("LEN field is not valid UTF-8")?
-        .trim()
+    let length: usize = std::str::from_utf8(&value)?
         .parse()
         .context("LEN field is not an integer")?;
+    let record_end = record_start
+        .checked_add(length)
+        .filter(|&end| end <= cursor.bytes.len() && end > cursor.pos)
+        .ok_or_else(|| {
+            anyhow!("Type-{record_type}: invalid or truncated record length {length}")
+        })?;
+    if cursor.bytes[record_end - 1] != FIELD_SEPARATOR {
+        bail!("Type-{record_type}: record does not end with FS at its declared length");
+    }
+    let mut local = Cursor {
+        bytes: &cursor.bytes[record_start..record_end],
+        pos: cursor.pos - record_start,
+    };
     let mut record = NistRecord {
         record_type,
         idc: 0,
         fields: vec![TextField::new(1, "LEN", length.to_string())],
         image_data: None,
+        binary_header: None,
     };
-    // Now consume fields until we see RS or hit length.
     loop {
-        match cursor.peek() {
-            Some(RECORD_SEPARATOR) => {
-                cursor.pos += 1;
-                return Ok(record);
-            }
-            Some(b) if is_separator(b) => {
-                // FS ends the record; GS is followed by another tag.
-                if b == FIELD_SEPARATOR {
-                    cursor.pos += 1;
-                    return Ok(record);
-                }
-                cursor.pos += 1;
-            }
-            None => return Ok(record),
-            Some(_) => {}
+        match local.peek() {
+            Some(FIELD_SEPARATOR) if local.pos == length - 1 => break,
+            Some(GROUP_SEPARATOR) => local.pos += 1,
+            _ => bail!(
+                "Type-{record_type}: expected field separator at byte {}",
+                local.pos
+            ),
         }
-        // Parse next tag. The value slice is only trustworthy for text
-        // fields; binary image data may contain separator bytes.
-        let (crt, field, value, value_start) = match read_tag(cursor) {
-            Ok(t) => t,
-            Err(_) => {
-                // Truncated at end of record — bail gracefully.
-                return Ok(record);
-            }
-        };
+        let (crt, field, value, value_start) = read_tag(&mut local, charset)?;
         if crt != record_type {
-            bail!(
-                "record type changed mid-record at pos {}: expected {}, got {}",
-                value_start,
-                record_type,
-                crt
-            );
+            bail!("record type changed mid-record: expected {record_type}, got {crt}");
         }
-        // If this is the DATA field (999), grab exactly the bytes the
-        // declared record `length` says remain — the image payload extends
-        // to the end of the record and may contain separator-like bytes.
         if field == 999 {
-            let data_len = length.saturating_sub(value_start - record_start);
-            let end = (value_start + data_len).min(cursor.bytes.len());
-            let mut data = cursor.bytes[value_start..end].to_vec();
-            // Some writers append a record-terminating separator inside the
-            // declared length; strip it so the payload starts/ends cleanly.
-            while data.last().is_some_and(|b| is_separator(*b)) {
-                data.pop();
-            }
-            cursor.pos = end;
-            record.fields.push(TextField::new(999, "DATA", String::new()));
-            record.image_data = Some(data);
-            return Ok(record);
-        } else {
-            let decoded = decode_charset(&value, charset);
-            if field == 2 {
-                // Field 2 is always the IDC for text records.
-                if let Ok(idc) = decoded.trim().parse::<u8>() {
-                    record.idc = idc;
-                }
-            }
-            record.fields.push(TextField::new(field, code_for(record_type, field), decoded));
+            // Only the final FS belongs to the framing. Every preceding byte,
+            // including any separator-like bytes, belongs to the image.
+            record.image_data = Some(local.bytes[value_start..length - 1].to_vec());
+            record.fields.push(TextField::new(999, "DATA", ""));
+            break;
         }
+        let decoded = if field == 2 {
+            String::from_utf8_lossy(&value).into_owned()
+        } else {
+            decode_charset(&value, charset)
+        };
+        if field == 2 {
+            record.idc = decoded
+                .trim()
+                .parse()
+                .context("IDC is not an unsigned byte")?;
+        }
+        record.fields.push(TextField::parsed(
+            field,
+            code_for(record_type, field),
+            decoded,
+            value,
+        ));
     }
+    cursor.pos = record_end;
+    Ok(record)
 }
 
 /// Parse a binary fingerprint/image record (Types 3-8). The first 4 bytes are
@@ -406,8 +410,28 @@ fn read_binary_record(cursor: &mut Cursor<'_>, record_type: u8) -> Result<NistRe
     if record_type == 8 {
         return read_signature_record(cursor);
     }
+    let start = cursor.pos;
     let len_bytes = cursor.read_n(4)?;
-    let length = u32::from_be_bytes([len_bytes[0], len_bytes[1], len_bytes[2], len_bytes[3]]) as usize;
+    let length =
+        u32::from_be_bytes([len_bytes[0], len_bytes[1], len_bytes[2], len_bytes[3]]) as usize;
+    if record_type == 7 {
+        if length < 5 {
+            bail!("Type-7: record length must be at least 5 bytes");
+        }
+        let idc = cursor.read_n(1)?[0];
+        let header = cursor.bytes[start..cursor.pos].to_vec();
+        let payload = cursor.read_n(length - 5)?.to_vec();
+        return Ok(NistRecord {
+            record_type,
+            idc,
+            fields: vec![
+                TextField::new(1, "LEN", length.to_string()),
+                TextField::new(2, "IDC", idc.to_string()),
+            ],
+            image_data: Some(payload),
+            binary_header: Some(header),
+        });
+    }
     // Header is 18 bytes total: LEN(4) IDC(1) IMP(1) FGP(6) ISR(1) HLL(2)
     // VLL(2) GCA(1) — see ANSI/NIST-ITL 1-2011, Table 4.
     if length < 18 {
@@ -419,7 +443,7 @@ fn read_binary_record(cursor: &mut Cursor<'_>, record_type: u8) -> Result<NistRe
     }
     let idc = cursor.read_n(1)?[0];
     let imp = cursor.read_n(1)?[0];
-    let _fgp = cursor.read_n(6)?;
+    let fgp = cursor.read_n(6)?.to_vec();
     let isr = cursor.read_n(1)?[0];
     let hll_bytes = cursor.read_n(2)?;
     let hll = u16::from_be_bytes([hll_bytes[0], hll_bytes[1]]);
@@ -427,16 +451,8 @@ fn read_binary_record(cursor: &mut Cursor<'_>, record_type: u8) -> Result<NistRe
     let vll = u16::from_be_bytes([vll_bytes[0], vll_bytes[1]]);
     let gca = cursor.read_n(1)?[0];
 
-    let payload_len = length.saturating_sub(18);
-    let payload = if cursor.pos + payload_len <= cursor.bytes.len() {
-        let data = cursor.bytes[cursor.pos..cursor.pos + payload_len].to_vec();
-        cursor.pos += payload_len;
-        data
-    } else {
-        let data = cursor.bytes[cursor.pos..].to_vec();
-        cursor.pos = cursor.bytes.len();
-        data
-    };
+    let header = cursor.bytes[start..cursor.pos].to_vec();
+    let payload = cursor.read_n(length - 18)?.to_vec();
 
     // The 1-byte GCA code (0=NONE, 1=JPEGB, 2=JPEGL) predates WSQ; sniff the
     // payload magic so WSQ/JPEG content is recognized regardless of timing
@@ -457,12 +473,21 @@ fn read_binary_record(cursor: &mut Cursor<'_>, record_type: u8) -> Result<NistRe
             TextField::new(1, "LEN", length.to_string()),
             TextField::new(2, "IDC", idc.to_string()),
             TextField::new(3, "IMP", imp.to_string()),
+            TextField::new(
+                4,
+                "FGP",
+                fgp.iter()
+                    .map(u8::to_string)
+                    .collect::<Vec<_>>()
+                    .join("\u{1e}"),
+            ),
             TextField::new(5, "ISR", isr.to_string()),
             TextField::new(6, "HLL", hll.to_string()),
             TextField::new(7, "VLL", vll.to_string()),
             TextField::new(8, "GCA", compression),
         ],
         image_data: Some(payload),
+        binary_header: Some(header),
     };
     Ok(record)
 }
@@ -477,6 +502,9 @@ fn read_next_record(
     charset: Charset,
     expected_type: Option<u8>,
 ) -> Result<Option<NistRecord>> {
+    if let Some(record_type @ 3..=8) = expected_type {
+        return read_binary_record(cursor, record_type).map(Some);
+    }
     // Skip any leftover whitespace/separators between records.
     while matches!(cursor.peek(), Some(b) if b == RECORD_SEPARATOR || b == FIELD_SEPARATOR) {
         cursor.pos += 1;
@@ -517,63 +545,55 @@ fn read_next_record(
 /// Decode an entire NIST file from a byte buffer.
 pub fn decode(bytes: &[u8]) -> Result<NistFile> {
     let mut cursor = Cursor::new(bytes);
-    let (transaction, charset) = read_type1(&mut cursor)
-        .context("failed to parse Type-1 transaction information record")?;
-    // The CNT field (1.003) lists `type<US>count` entries separated by RS.
-    // We use it only as a fallback for binary records (Types 3-8) whose tags
-    // cannot be discovered by scanning, because they begin with a binary
-    // 4-byte length instead of an ASCII tag.
-    let mut binary_queue: Vec<u8> = transaction
+    let (transaction, charset) =
+        read_type1(&mut cursor).context("failed to parse Type-1 transaction information record")?;
+    let mut warnings = Vec::new();
+    if transaction
+        .field_value("LEN")
+        .and_then(|s| s.parse::<usize>().ok())
+        != Some(cursor.pos)
+    {
+        warnings.push("Type-1 length does not match the record bytes".into());
+    }
+    let types = transaction
         .field_value("CNT")
-        .map(|cnt| parse_cnt_types(cnt))
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|t| (3..=8).contains(t))
-        .collect();
-
+        .map(parse_cnt_types)
+        .unwrap_or_default();
     let mut records = Vec::new();
-    loop {
-        let start_pos = cursor.pos;
-        match read_next_record(&mut cursor, charset, None) {
-            Ok(Some(rec)) => {
-                let rt = rec.record_type;
-                records.push(rec);
-                if let Some(idx) = binary_queue.iter().position(|t| *t == rt) {
-                    binary_queue.remove(idx);
-                }
-            }
+    while cursor.remaining() > 0 {
+        let start = cursor.pos;
+        match read_next_record(&mut cursor, charset, types.get(records.len()).copied()) {
+            Ok(Some(record)) => records.push(record),
             Ok(None) => {
-                // No ASCII tag found — maybe a binary record with no tag.
-                cursor.pos = start_pos;
-                if cursor.remaining() > 0 && !binary_queue.is_empty() {
-                    let binary_type = binary_queue[0];
-                    match read_binary_record(&mut cursor, binary_type) {
-                        Ok(rec) => {
-                            records.push(rec);
-                            binary_queue.remove(0);
-                            continue;
-                        }
-                        Err(_) => break,
-                    }
-                }
+                cursor.pos = start;
                 break;
             }
-            Err(e) => {
-                // Tolerate parse errors on later records so the viewer still
-                // shows what it could read.
-                eprintln!(
-                    "warning: stopping early at byte {}: {}",
-                    start_pos, e
-                );
+            Err(error) => {
+                warnings.push(format!("Stopped at byte {start}: {error:#}"));
+                cursor.pos = start;
                 break;
             }
         }
     }
-
+    if cursor.pos != bytes.len() {
+        warnings.push(format!(
+            "{} input bytes could not be parsed",
+            bytes.len() - cursor.pos
+        ));
+    }
+    let declared_count = transaction
+        .field_value("CNT")
+        .and_then(|cnt| cnt.split('\u{1e}').next())
+        .and_then(|entry| entry.split('\u{1f}').nth(1))
+        .and_then(|count| count.parse::<usize>().ok());
+    if declared_count != Some(records.len()) || types.len() != records.len() {
+        warnings.push("CNT does not match the number of parsed records".into());
+    }
     Ok(NistFile {
         transaction,
         records,
         bytes_read: cursor.pos,
+        warnings,
     })
 }
 
@@ -583,8 +603,10 @@ pub fn decode(bytes: &[u8]) -> Result<NistFile> {
 /// (ISR = 1) store one **bit** per pixel, MSB-first per byte.
 fn read_signature_record(cursor: &mut Cursor<'_>) -> Result<NistRecord> {
     const HEADER_SIZE: usize = 12;
+    let start = cursor.pos;
     let len_bytes = cursor.read_n(4)?;
-    let length = u32::from_be_bytes([len_bytes[0], len_bytes[1], len_bytes[2], len_bytes[3]]) as usize;
+    let length =
+        u32::from_be_bytes([len_bytes[0], len_bytes[1], len_bytes[2], len_bytes[3]]) as usize;
     if length < HEADER_SIZE {
         bail!("Type-8: invalid record length {length}");
     }
@@ -597,16 +619,8 @@ fn read_signature_record(cursor: &mut Cursor<'_>) -> Result<NistRecord> {
     let vll_bytes = cursor.read_n(2)?;
     let vll = u16::from_be_bytes([vll_bytes[0], vll_bytes[1]]);
 
-    let payload_len = length - HEADER_SIZE;
-    let payload = if cursor.pos + payload_len <= cursor.bytes.len() {
-        let data = cursor.bytes[cursor.pos..cursor.pos + payload_len].to_vec();
-        cursor.pos += payload_len;
-        data
-    } else {
-        let data = cursor.bytes[cursor.pos..].to_vec();
-        cursor.pos = cursor.bytes.len();
-        data
-    };
+    let header = cursor.bytes[start..cursor.pos].to_vec();
+    let payload = cursor.read_n(length - HEADER_SIZE)?.to_vec();
 
     let compression = sniff_compression(&payload)
         .map(str::to_string)
@@ -626,6 +640,7 @@ fn read_signature_record(cursor: &mut Cursor<'_>) -> Result<NistRecord> {
             TextField::new(8, "GCA", compression),
         ],
         image_data: Some(payload),
+        binary_header: Some(header),
     };
     Ok(record)
 }
@@ -644,22 +659,10 @@ pub fn sniff_compression(data: &[u8]) -> Option<&'static str> {
     }
 }
 
-/// Parses the Type-1 `CNT` field into the expanded list of record types.
-/// Format: `type1<US>count1<RS>type2<US>count2...`.
+/// Each CNT subfield after the first describes one record as type<US>IDC.
 fn parse_cnt_types(cnt: &str) -> Vec<u8> {
-    let mut types = Vec::new();
-    for entry in cnt.split('\u{1E}') {
-        let mut parts = entry.split('\u{1F}');
-        let Some(t) = parts.next().and_then(|p| p.trim().parse::<u8>().ok()) else {
-            continue;
-        };
-        let count: usize = parts
-            .next()
-            .and_then(|p| p.trim().parse().ok())
-            .unwrap_or(1);
-        for _ in 0..count.min(255) {
-            types.push(t);
-        }
-    }
-    types
+    cnt.split('\u{1e}')
+        .skip(1)
+        .filter_map(|entry| entry.split('\u{1f}').next()?.trim().parse().ok())
+        .collect()
 }

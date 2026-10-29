@@ -20,16 +20,17 @@
  * OTHER DEALINGS IN THE SOFTWARE.
  */
 
-//! NIST biometric file format (ANSI/NIST-ITL) parsing.
+//! NIST biometric file format (ANSI/NIST-ITL) parsing and serialization.
 //!
 //! Implements the Traditional Encoding of an ANSI/NIST-ITL file: a stream of
-//! logical records separated by ASCII `RS` (0x1E), with tag/value pairs inside
-//! each record terminated by `FS` (0x1C). Image records (Types 3-17) use a
-//! binary header followed by a binary data payload.
+//! tagged logical records terminated by ASCII `FS` (0x1C), with tag/value pairs
+//! separated by `GS` (0x1D). Legacy image records (Types 3-8) use a binary
+//! header followed by a binary data payload.
 
 pub mod format;
 pub mod parser;
 pub mod records;
+pub mod writer;
 
 pub use format::*;
 pub use parser::NistFile;
